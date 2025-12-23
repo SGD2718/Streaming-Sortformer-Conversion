@@ -204,7 +204,7 @@ def validate(model_name, coreml_dir, audio_path):
 
     pre_encode_model = ct.models.MLModel(
         os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
-        compute_units=ct.ComputeUnit.CPU_ONLY
+        compute_units=ct.ComputeUnit.ALL
     )
     
     # =========================================

@@ -15,39 +15,61 @@ lib.define('safe_concat(Tensor[] embs, Tensor[] lengths) -> (Tensor, Tensor)')
 
 
 # ==========================================
-# 2. PyTorch Implementation Logic
+# 2. PyTorch Implementation Logic (ANE-safe)
 # ==========================================
 def safe_concat_impl(embs: List[Tensor], lengths: List[Tensor]):
-    # 1. Collect Valid Slices (Same as before)
-    sliced_parts = []
-    max_total_length = 0
-    for emb, length in zip(embs, lengths):
-        limit = length[0]
-        max_total_length += emb.shape[1]
-        sliced_parts.append(emb[:, :limit, :])
-
-    # 2. Concatenate valid data -> Shape: (1, current_len, D)
-    actual_content = torch.cat(sliced_parts, dim=1)
-
-    # 3. Calculate how much to pad
-    B, current_len, D = actual_content.shape
-    pad_len = max_total_length - current_len
-
-    # 4. Create the padding block manually
-    # We create a block of zeros with shape (1, pad_len, D)
-    # Ensure it matches the device/dtype of your content
-    padding_block = torch.zeros(
-        (B, pad_len, D),
-        dtype=actual_content.dtype,
-        device=actual_content.device
-    )
-
-    # 5. Concatenate them: [Content | Zeros] -> Shape: (1, max_total_len, D)
-    fixed_output = torch.cat([actual_content, padding_block], dim=1)
-
-    total_length = sum(lengths)
-
-    return fixed_output, total_length
+    """
+    ANE-safe concat and pad using gather with arithmetic-computed indices.
+    
+    Args:
+        embs: List of 3 tensors [spkcache, fifo, chunk], each (B, seq_len, D)
+        lengths: List of 3 length tensors, each (1,) or scalar
+                 First two may be 0, third is always > 0
+    
+    Returns:
+        output: (B, max_total_len, D) with valid frames packed at the start
+        total_length: sum of lengths
+    """
+    B, _, D = embs[0].shape
+    device = embs[0].device
+    
+    # Fixed sizes (known at trace time)
+    size0, size1, size2 = embs[0].shape[1], embs[1].shape[1], embs[2].shape[1]
+    total_input_size = size0 + size1 + size2
+    max_total_len = total_input_size
+    
+    # Concatenate all embeddings at full size
+    full_concat = torch.cat(embs, dim=1)
+    
+    # Get lengths (reshape to scalar for efficient broadcast)
+    len0 = lengths[0].reshape(())
+    len1 = lengths[1].reshape(())
+    len2 = lengths[2].reshape(())
+    total_length = len0 + len1 + len2
+    
+    # Output positions
+    out_pos = torch.arange(max_total_len, device=device, dtype=torch.long)
+    
+    # Compute gather indices using arithmetic
+    cumsum0 = len0
+    cumsum1 = len0 + len1
+    
+    # Segment indicators (bool -> long for arithmetic)
+    in_seg1_or_2 = (out_pos >= cumsum0).long()
+    in_seg2 = (out_pos >= cumsum1).long()
+    
+    # Compute offset and gather index
+    offset = in_seg1_or_2 * (size0 - len0) + in_seg2 * (size1 - len1)
+    gather_idx = (out_pos + offset).clamp(0, total_input_size - 1)
+    
+    # Expand for gather
+    gather_idx = gather_idx.unsqueeze(0).unsqueeze(-1).expand(B, max_total_len, D)
+    
+    # Gather and mask padding
+    output = torch.gather(full_concat, dim=1, index=gather_idx)
+    output = output * (out_pos < total_length).float().unsqueeze(0).unsqueeze(-1)
+    
+    return output, total_length
 
 
 # --- Register Implementations ---

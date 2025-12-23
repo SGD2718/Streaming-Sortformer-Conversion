@@ -54,7 +54,7 @@ def streaming_feat_loader(modules, feat_seq, feat_seq_length, feat_seq_offset):
         chunk_idx += 1
 
 
-def run_coreml_streaming(nemo_model, pre_encoder_model, head_model, audio_path, config):
+def run_coreml_streaming(nemo_model, main_model, audio_path, config):
     """Run streaming diarization using CoreML model."""
     modules = nemo_model.sortformer_modules
     subsampling_factor = modules.subsampling_factor
@@ -131,13 +131,10 @@ def run_coreml_streaming(nemo_model, pre_encoder_model, head_model, audio_path, 
         }
         
         # Run CoreML model
-        preenc_start = time.time()
-        pre_encoder_out = pre_encoder_model.predict(coreml_inputs)
-        preenc_end = time.time()
-        coreml_out = head_model.predict(pre_encoder_out)
-        out_end = time.time()
-        print(f"Pre-Encoder time: {preenc_end - preenc_start}")
-        print(f"Head time: {out_end - preenc_end}")
+        st_time = time.time()
+        coreml_out = main_model.predict(coreml_inputs)
+        ed_time = time.time()
+        print(f"Inference time: {ed_time - st_time}")
 
         pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
         chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
@@ -263,19 +260,15 @@ def main():
     
     # --- Load CoreML model ---
     print(f"Loading CoreML Model from {coreml_dir}...")
-    pre_encoder_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
-        compute_units=ct.ComputeUnit.CPU_ONLY  # For compatibility
+    main_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "SortformerPipeline.mlpackage"),
+        compute_units=ct.ComputeUnit.ALL
     )
-    head_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_Head.mlpackage"),
-        compute_units=ct.ComputeUnit.ALL  # For compatibility
-    )
-    
+
     # --- Run Inference ---
     print("Running CoreML streaming inference...")
     st_time = time.time()
-    probs_tensor = run_coreml_streaming(nemo_model, pre_encoder_model, head_model, audio_file, CONFIG)
+    probs_tensor = run_coreml_streaming(nemo_model, main_model, audio_file, CONFIG)
     ed_time = time.time()
     print(f'duration: {ed_time - st_time}')
     

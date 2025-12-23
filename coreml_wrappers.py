@@ -4,37 +4,76 @@ from safe_concat import *
 from nemo.collections.asr.models import SortformerEncLabelModel
 
 
-# @torch.jit.script
 def fixed_concat_and_pad(embs, lengths, max_total_len=188+188+6):
-    # 1. Collect Valid Slices (Same as before)
-    sliced_parts = []
-    for emb, length in zip(embs, lengths):
-        limit = length[0]
-        if limit > 0:
-            sliced_parts.append(emb[:, :limit, :])
-
-    # 2. Concatenate valid data -> Shape: (1, current_len, D)
-    actual_content = torch.cat(sliced_parts, dim=1)
-
-    # 3. Calculate how much to pad
-    B, current_len, D = actual_content.shape
-    pad_len = max_total_len - current_len
-
-    # 4. Create the padding block manually
-    # We create a block of zeros with shape (1, pad_len, D)
-    # Ensure it matches the device/dtype of your content
-    padding_block = torch.zeros(
-        (B, pad_len, D),
-        dtype=actual_content.dtype,
-        device=actual_content.device
-    )
-
-    # 5. Concatenate them: [Content | Zeros] -> Shape: (1, max_total_len, D)
-    fixed_output = torch.cat([actual_content, padding_block], dim=1)
-
-    total_length = sum(lengths)
-
-    return fixed_output, total_length
+    """
+    ANE-safe concat and pad that avoids zero-length slices.
+    
+    Uses gather with arithmetic-computed indices to pack valid frames efficiently.
+    
+    Args:
+        embs: List of 3 tensors [spkcache, fifo, chunk], each (B, seq_len, D)
+        lengths: List of 3 length tensors, each (1,) or scalar
+                 First two may be 0, third is always > 0
+        max_total_len: Output sequence length (padded with zeros)
+    
+    Returns:
+        output: (B, max_total_len, D) with valid frames packed at the start
+        total_length: sum of lengths
+    """
+    B, _, D = embs[0].shape
+    device = embs[0].device
+    
+    # Fixed sizes (known at trace time, becomes constants in graph)
+    size0, size1, size2 = embs[0].shape[1], embs[1].shape[1], embs[2].shape[1]
+    total_input_size = size0 + size1 + size2
+    
+    # Concatenate all embeddings at full size (no zero-length slices!)
+    full_concat = torch.cat(embs, dim=1)  # (B, total_input_size, D)
+    
+    # Get lengths (reshape to scalar for efficient broadcast)
+    len0 = lengths[0].reshape(())
+    len1 = lengths[1].reshape(())
+    len2 = lengths[2].reshape(())
+    total_length = len0 + len1 + len2
+    
+    # Output positions: [0, 1, 2, ..., max_total_len-1]
+    out_pos = torch.arange(max_total_len, device=device, dtype=torch.long)
+    
+    # Compute gather indices using arithmetic (more efficient than multiple where())
+    # 
+    # For output position p:
+    #   seg0 (p < len0):           index = p
+    #   seg1 (len0 <= p < len0+len1): index = (p - len0) + size0 = p + (size0 - len0)
+    #   seg2 (len0+len1 <= p < total): index = (p - len0 - len1) + size0 + size1
+    #                                        = p + (size0 + size1 - len0 - len1)
+    #
+    # This simplifies to: index = p + offset, where offset depends on segment.
+    # offset_seg0 = 0
+    # offset_seg1 = size0 - len0
+    # offset_seg2 = size0 + size1 - len0 - len1 = offset_seg1 + (size1 - len1)
+    #
+    # Using segment indicators (0 or 1):
+    #   offset = in_seg1_or_2 * (size0 - len0) + in_seg2 * (size1 - len1)
+    
+    cumsum0 = len0
+    cumsum1 = len0 + len1
+    
+    # Segment indicators (bool -> long for arithmetic)
+    in_seg1_or_2 = (out_pos >= cumsum0).long()  # 1 if in seg1 or seg2
+    in_seg2 = (out_pos >= cumsum1).long()       # 1 if in seg2
+    
+    # Compute offset and gather index
+    offset = in_seg1_or_2 * (size0 - len0) + in_seg2 * (size1 - len1)
+    gather_idx = (out_pos + offset).clamp(0, total_input_size - 1)
+    
+    # Expand for gather: (B, max_total_len, D)
+    gather_idx = gather_idx.unsqueeze(0).unsqueeze(-1).expand(B, max_total_len, D)
+    
+    # Gather and mask padding
+    output = torch.gather(full_concat, dim=1, index=gather_idx)
+    output = output * (out_pos < total_length).float().unsqueeze(0).unsqueeze(-1)
+    
+    return output, total_length
 
 
 class PreprocessorWrapper(nn.Module):
