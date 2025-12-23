@@ -111,11 +111,10 @@ class MicrophoneStream:
 class StreamingDiarizer:
     """Real-time streaming diarization using CoreML."""
     
-    def __init__(self, nemo_model, preproc_model, pre_encoder_model, head_model, config):
+    def __init__(self, nemo_model, preproc_model, main_model, config):
         self.modules = nemo_model.sortformer_modules
         self.preproc_model = preproc_model
-        self.pre_encoder_model = pre_encoder_model
-        self.head_model = head_model
+        self.main_model = main_model
         self.config = config
         
         # Audio buffer
@@ -249,11 +248,10 @@ class StreamingDiarizer:
             }
 
             st_time = time.time_ns()
-            pre_encoder_out = self.pre_encoder_model.predict(coreml_inputs)
-            coreml_out = self.head_model.predict(pre_encoder_out)
+            coreml_out = self.main_model.predict(coreml_inputs)
             ed_time = time.time_ns()
             print(f"duration: {1e-6 * (ed_time - st_time)}")
-            
+
             pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
             chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
             chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
@@ -322,17 +320,13 @@ def run_mic_inference(model_name, coreml_dir):
         os.path.join(coreml_dir, "Pipeline_Preprocessor.mlpackage"),
         compute_units=ct.ComputeUnit.CPU_ONLY
     )
-    pre_encoder_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
-        compute_units=ct.ComputeUnit.CPU_ONLY
-    )
-    head_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_Head.mlpackage"),
+    main_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "SortformerPipeline.mlpackage"),
         compute_units=ct.ComputeUnit.ALL
     )
     
     # Create diarizer
-    diarizer = StreamingDiarizer(nemo_model, preproc_model, pre_encoder_model, head_model, CONFIG)
+    diarizer = StreamingDiarizer(nemo_model, preproc_model, main_model, CONFIG)
     
     # Audio queue
     audio_queue = queue.Queue()
@@ -440,12 +434,8 @@ def run_file_demo(model_name, coreml_dir, audio_path):
         os.path.join(coreml_dir, "Pipeline_Preprocessor.mlpackage"),
         compute_units=ct.ComputeUnit.CPU_ONLY
     )
-    pre_encoder_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
-        compute_units=ct.ComputeUnit.CPU_ONLY
-    )
-    head_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_Head.mlpackage"),
+    main_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "SortformerPipeline.mlpackage"),
         compute_units=ct.ComputeUnit.ALL
     )
     
@@ -455,7 +445,7 @@ def run_file_demo(model_name, coreml_dir, audio_path):
     print(f"Loaded audio: {len(audio)} samples ({len(audio)/CONFIG['sample_rate']:.1f}s)")
     
     # Create diarizer
-    diarizer = StreamingDiarizer(nemo_model, preproc_model, pre_encoder_model, head_model, CONFIG)
+    diarizer = StreamingDiarizer(nemo_model, preproc_model, main_model, CONFIG)
     
     # Setup plot
     plt.ion()
