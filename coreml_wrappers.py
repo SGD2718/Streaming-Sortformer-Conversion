@@ -1,7 +1,5 @@
 import torch
 from torch import nn
-from safe_concat import *
-from nemo.collections.asr.models import SortformerEncLabelModel
 
 
 def fixed_concat_and_pad(embs, lengths, max_total_len=188+188+6):

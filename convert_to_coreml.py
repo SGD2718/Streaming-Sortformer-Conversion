@@ -1,17 +1,12 @@
 import torch
-import torch.nn as nn
 import coremltools as ct
 import argparse
 import os
-import sys
 import numpy as np
-import types
 
-# Ensure we use the right environment for imports
-# (User's environment has 'nemo' installed)
 from nemo.collections.asr.models import SortformerEncLabelModel
-from nemo.collections.asr.parts.preprocessing.features import FilterbankFeaturesTA
-from coreml_wrappers import *
+from coreml_wrappers import PreprocessorWrapper, PreEncoderWrapper, SortformerHeadWrapper
+from config import Config
 
 
 def convert_pre_encoder(
@@ -143,12 +138,12 @@ def export_pipeline(
 
     # Configure for streaming
     print("Configuring for streaming...")
-    model.sortformer_modules.chunk_len = 6
-    model.sortformer_modules.chunk_right_context = 1
-    model.sortformer_modules.chunk_left_context = 1
-    model.sortformer_modules.fifo_len = 40
-    model.sortformer_modules.spkcache_len = 120
-    model.sortformer_modules.spkcache_update_period = 32
+    model.sortformer_modules.chunk_len = Config.chunk_len
+    model.sortformer_modules.chunk_right_context = Config.chunk_right_context
+    model.sortformer_modules.chunk_left_context = Config.chunk_left_context
+    model.sortformer_modules.fifo_len = Config.fifo_len
+    model.sortformer_modules.spkcache_len = Config.spkcache_len
+    model.sortformer_modules.spkcache_update_period = Config.spkcache_update_period
 
     modules = model.sortformer_modules
     preprocessor = model.preprocessor
@@ -160,8 +155,7 @@ def export_pipeline(
 
     # Calculate dimensions
     chunk_len = modules.chunk_len
-    input_chunk_time = (
-                                   chunk_len + modules.chunk_left_context + modules.chunk_right_context) * modules.subsampling_factor
+    input_chunk_time = (chunk_len + modules.chunk_left_context + modules.chunk_right_context) * modules.subsampling_factor
     fc_d_model = modules.fc_d_model  # 512 - Conformer output
     tf_d_model = modules.tf_d_model  # 192 - Transformer input (after projection)
     spkcache_len = modules.spkcache_len
@@ -182,8 +176,8 @@ def export_pipeline(
     print(f"Feature dim: {feat_dim}, FC d_model: {fc_d_model}, TF d_model: {tf_d_model}")
 
     # Audio samples for preprocessor
-    stride = 160
-    window = 400
+    stride = Config.mel_stride
+    window = Config.mel_window
     audio_samples = (input_chunk_time - 1) * stride + window
     print(audio_samples)
 
@@ -216,8 +210,8 @@ def export_pipeline(
             compute_precision=get_precision(preproc_precision),
             compute_units=ct.ComputeUnit.ALL
         )
-        preproc_mlmodel.save(os.path.join(output_dir, "Pipeline_Preprocessor.mlpackage"))
-        print("  Saved Pipeline_Preprocessor.mlpackage")
+        preproc_mlmodel.save(os.path.join(output_dir, "SortformerPreprocessor.mlpackage"))
+        print("  Saved SortformerPreprocessor.mlpackage")
 
     # =========================================================
     # 2. Export Pre-Encoder
@@ -235,12 +229,12 @@ def export_pipeline(
         pre_encoder_mlmodel, _ = convert_pre_encoder(
             model,
             get_precision(pre_encoder_precision),
-            os.path.join(output_dir, "Pipeline_PreEncoder.mlpackage"),
+            os.path.join(output_dir, "SortformerPreEncoder.mlpackage"),
             input_chunk, input_chunk_len,
             input_spkcache, input_spkcache_len,
             input_fifo, input_fifo_len
         )
-        print("  Saved Pipeline_PreEncoder.mlpackage")
+        print("  Saved SortformerPreEncoder.mlpackage")
 
     # =========================================================
     # 3. Export Conformer Encoder
@@ -256,11 +250,11 @@ def export_pipeline(
         head_mlmodel, _ = convert_head(
             model,
             get_precision(head_precision),
-            os.path.join(output_dir, "Pipeline_Head.mlpackage"),
+            os.path.join(output_dir, "SortformerHead.mlpackage"),
             pre_encoder_embs, pre_encoder_lengths,
             chunk_pre_encoder_embs, chunk_pre_encoder_lengths
         )
-        print("  Saved Pipeline_Head.mlpackage")
+        print("  Saved SortformerHead.mlpackage")
 
     # =========================================================
     # 5. Create Combined Pipelines
@@ -271,10 +265,10 @@ def export_pipeline(
     if skip_modules and not verify:
         print('Loading Pipeline CoreML Modules...')
         pre_encoder_mlmodel = ct.models.MLModel(
-            os.path.join(output_dir, "Pipeline_PreEncoder.mlpackage")
+            os.path.join(output_dir, "SortformerPreEncoder.mlpackage")
         )
         head_mlmodel = ct.models.MLModel(
-            os.path.join(output_dir, "Pipeline_Head.mlpackage")
+            os.path.join(output_dir, "SortformerHead.mlpackage")
         )
 
         assert pre_encoder_mlmodel is not None and head_mlmodel is not None
@@ -317,9 +311,9 @@ def export_pipeline(
     print("=" * 70)
     print(f"Output directory: {output_dir}")
     print("\nExported models:")
-    print(f"  1. Pipeline_Preprocessor.mlpackage        ({preproc_precision})")
-    print(f"  2. Pipeline_PreEncoder.mlpackage          ({pre_encoder_precision})")
-    print(f"  3. Pipeline_Head.mlpackage                ({head_precision})")
+    print(f"  1. SortformerPreprocessor.mlpackage        ({preproc_precision})")
+    print(f"  2. SortformerPreEncoder.mlpackage          ({pre_encoder_precision})")
+    print(f"  3. SortformerHead.mlpackage                ({head_precision})")
     print(f"  5. SortformerPipeline.mlpackage           (combined: PreEncoder+Head)")
     print("\nUsage in inference:")
     print("  audio -> Preprocessor -> features")

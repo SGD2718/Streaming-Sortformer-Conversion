@@ -20,6 +20,7 @@ import math
 import time
 from pydub import AudioSegment
 from pydub.playback import play as play_audio
+from config import Config
 
 # Use TkAgg for interactive plots on Mac
 matplotlib.use("TkAgg")
@@ -222,15 +223,15 @@ def main():
     
     # CoreML export configuration (must match export settings)
     CONFIG = {
-        'chunk_len': 6,
-        'chunk_right_context': 1,
-        'chunk_left_context': 1,
-        'fifo_len': 40,
-        'spkcache_len': 120,
-        'spkcache_update_period': 30,
-        'chunk_frames': 64,  # (chunk_len + left_context + right_context) * subsampling_factor = (4+1+1)*8
-        'fifo_input_len': 40,  # CoreML model input size
-        'spkcache_input_len': 120,  # CoreML model input size
+        'chunk_len': Config.chunk_len,
+        'chunk_right_context': Config.chunk_right_context,
+        'chunk_left_context': Config.chunk_left_context,
+        'fifo_len': Config.fifo_len,
+        'spkcache_len': Config.spkcache_len,
+        'spkcache_update_period': Config.spkcache_update_period,
+        'chunk_frames': Config.chunk_frames,  # (chunk_len + left_context + right_context) * subsampling_factor = (4+1+1)*8
+        'fifo_input_len': Config.fifo_len,  # CoreML model input size
+        'spkcache_input_len': Config.spkcache_len,  # CoreML model input size
     }
 
     # Load audio for playback
@@ -321,7 +322,7 @@ def main():
     )
     
     # --- Add segment rectangles ---
-    frame_shift = 0.08  # 80ms per diarization frame
+    frame_shift = Config.frame_duration  # 80ms per diarization frame
     
     print(f"Found {len(segments)} segments:")
     for start_time, end_time, spk_idx in segments:

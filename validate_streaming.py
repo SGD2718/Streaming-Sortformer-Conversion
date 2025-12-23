@@ -12,6 +12,7 @@ from itertools import permutations
 
 # Import NeMo
 from nemo.collections.asr.models import SortformerEncLabelModel
+from config import Config
 
 
 def streaming_feat_loader(modules, feat_seq, feat_seq_length, feat_seq_offset):
@@ -52,7 +53,7 @@ def run_coreml_streaming_inference(nemo_model, pre_encode_model, head_model, aud
     """
     modules = nemo_model.sortformer_modules
     subsampling_factor = modules.subsampling_factor
-    sample_rate = 16000
+    sample_rate = Config.sample_rate
     
     COREML_CHUNK_FRAMES = coreml_config['chunk_frames']
     COREML_SPKCACHE_LEN = coreml_config['spkcache_len']
@@ -168,13 +169,13 @@ def validate(model_name, coreml_dir, audio_path):
     
     # CoreML export configuration
     COREML_CONFIG = {
-        'chunk_len': 6,
-        'chunk_right_context': 1,
-        'chunk_left_context': 1,
-        'fifo_len': 40,
-        'spkcache_len': 120,
-        'spkcache_update_period': 30,
-        'chunk_frames': 64,  # chunk_len * subsampling_factor
+        'chunk_len': Config.chunk_len,
+        'chunk_right_context': Config.chunk_right_context,
+        'chunk_left_context': Config.chunk_left_context,
+        'fifo_len': Config.fifo_len,
+        'spkcache_len': Config.spkcache_len,
+        'spkcache_update_period': Config.spkcache_update_period,
+        'chunk_frames': Config.chunk_frames,  # chunk_len * subsampling_factor
     }
     
     # Apply config to modules
@@ -198,12 +199,12 @@ def validate(model_name, coreml_dir, audio_path):
     # Load CoreML model
     print(f"Loading CoreML Model from {coreml_dir}...")
     head_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_Head.mlpackage"),
+        os.path.join(coreml_dir, "SortformerHead.mlpackage"),
         compute_units=ct.ComputeUnit.CPU_ONLY
     )
 
     pre_encode_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
+        os.path.join(coreml_dir, "SortformerPreEncoder.mlpackage"),
         compute_units=ct.ComputeUnit.ALL
     )
     
@@ -215,7 +216,7 @@ def validate(model_name, coreml_dir, audio_path):
     print("=" * 70)
     
     try:
-        sample_rate = 16000
+        sample_rate = Config.sample_rate
         full_audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
         audio_tensor = torch.from_numpy(full_audio).unsqueeze(0).float()
         audio_length = torch.tensor([len(full_audio)], dtype=torch.long)

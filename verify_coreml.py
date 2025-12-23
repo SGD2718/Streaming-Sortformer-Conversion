@@ -4,7 +4,8 @@ import coremltools as ct
 import os
 import argparse
 from nemo.collections.asr.models import SortformerEncLabelModel
-from nemo.collections.asr.parts.preprocessing.features import FilterbankFeaturesTA
+from config import Config
+
 
 def verify_models(model_name, coreml_model_dir):
     print(f"Loading NeMo model: {model_name}")
@@ -14,15 +15,15 @@ def verify_models(model_name, coreml_model_dir):
         nemo_model = SortformerEncLabelModel.from_pretrained(model_name, map_location="cpu")
     nemo_model.eval()
 
-    nemo_model.sortformer_modules.chunk_len = 4
-    nemo_model.sortformer_modules.chunk_right_context = 1
-    nemo_model.sortformer_modules.fifo_len = 125
-    nemo_model.sortformer_modules.spkcache_len = 125
-    nemo_model.sortformer_modules.spkcache_update_period = 63
+    nemo_model.sortformer_modules.chunk_len = Config.chunk_len
+    nemo_model.sortformer_modules.chunk_right_context = Config.chunk_right_context
+    nemo_model.sortformer_modules.fifo_len = Config.fifo_len
+    nemo_model.sortformer_modules.spkcache_len = Config.spkcache_len
+    nemo_model.sortformer_modules.spkcache_update_period = Config.spkcache_update_period
     
     # Load CoreML models
     preproc_path = os.path.join(coreml_model_dir, "SortformerPreprocessor.mlpackage")
-    main_path = os.path.join(coreml_model_dir, "Sortformer.mlpackage")
+    main_path = os.path.join(coreml_model_dir, "SortformerPipeline.mlpackage")
     
     print(f"Loading CoreML models from {coreml_model_dir}...")
     coreml_preproc = ct.models.MLModel(preproc_path)
@@ -47,8 +48,8 @@ def verify_models(model_name, coreml_model_dir):
     print(f"Config: Chunk Time={input_chunk_time}, Feat Dim={feat_dim}, SpkCache={spkcache_len}, Fifo={fifo_len}")
     
     # Calculate expected audio samples for preprocessor
-    stride = 160
-    window = 400
+    stride = Config.mel_stride
+    window = Config.mel_window
     expected_audio_samples = (input_chunk_time - 1) * stride + window
     print(f"Expected Audio Samples for CoreML: {expected_audio_samples}")
 
@@ -59,11 +60,11 @@ def verify_models(model_name, coreml_model_dir):
     if os.path.exists("audio.wav"):
         audio_path = "audio.wav"
         print(f"Loading {audio_path}...")
-        wav, sr_native = librosa.load(audio_path, sr=16000, mono=True)
+        wav, sr_native = librosa.load(audio_path, sr=Config.sample_rate, mono=True)
     else:
         print("audio.wav not found, generating dummy audio.")
         wav = np.random.randn(expected_audio_samples).astype(np.float32)
-        sr_native = 16000
+        sr_native = Config.sample_rate
 
     # Handle length
     current_samples = wav.shape[0]
