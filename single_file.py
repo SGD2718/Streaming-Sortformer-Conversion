@@ -46,17 +46,19 @@ def format_dict(d, indent_level: int = 0) -> str:
 
 
 # 3. Configure for ~0.32s Latency
+print(model.sortformer_modules)
+print(format_dict(model._cfg))
 model.sortformer_modules.chunk_len = 6  # Adjusted per your snippet
-model.sortformer_modules.chunk_right_context = 1
+model.sortformer_modules.chunk_right_context = 7
 model.sortformer_modules.chunk_left_context = 1
 
 model.sortformer_modules.fifo_len = 40
-model.sortformer_modules.spkcache_update_period = 42
-model.sortformer_modules.spkcache_len = 120
+model.sortformer_modules.spkcache_update_period = 40
+model.sortformer_modules.spkcache_len = 188
+
+model.sortformer_modules._check_streaming_parameters()
 
 
-print(model.sortformer_modules)
-print(format_dict(model._cfg))
 
 # --- 4. Run Inference ---
 try:

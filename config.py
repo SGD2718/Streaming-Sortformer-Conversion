@@ -1,10 +1,10 @@
 class Config:
     chunk_len = 6
-    chunk_right_context = 1
+    chunk_right_context = 7
     chunk_left_context = 1
-    fifo_len = 30
-    spkcache_len = 120
-    spkcache_update_period = 30
+    fifo_len = 40
+    spkcache_len = 188
+    spkcache_update_period = 40
 
     # do not touch these
     subsampling_factor = 8
