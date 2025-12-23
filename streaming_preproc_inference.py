@@ -187,9 +187,9 @@ def run_true_streaming(nemo_model, preproc_model, main_model, audio_path, config
         
         coreml_out = main_model.predict(coreml_inputs)
         
-        pred_logits = torch.from_numpy(coreml_out["preds"])
-        chunk_embs = torch.from_numpy(coreml_out["chunk_embs"])
-        chunk_emb_len = int(coreml_out["chunk_emb_lengths"][0])
+        pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
+        chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+        chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
         
         chunk_embs = chunk_embs[:, :chunk_emb_len, :]
         
@@ -295,9 +295,9 @@ def run_reference(nemo_model, main_model, audio_path, config):
         
         coreml_out = main_model.predict(coreml_inputs)
         
-        pred_logits = torch.from_numpy(coreml_out["preds"])
-        chunk_embs = torch.from_numpy(coreml_out["chunk_embs"])
-        chunk_emb_len = int(coreml_out["chunk_emb_lengths"][0])
+        pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
+        chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+        chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
         
         chunk_embs = chunk_embs[:, :chunk_emb_len, :]
         

@@ -200,9 +200,9 @@ def verify_models(model_name, coreml_model_dir):
     }
     
     c_out = coreml_main.predict(coreml_inputs)
-    c_preds = torch.from_numpy(c_out["preds"])
-    c_embs = torch.from_numpy(c_out["chunk_embs"])
-    # c_emb_lens = torch.from_numpy(c_out["chunk_emb_lengths"]) # Check if exists
+    c_preds = torch.from_numpy(c_out["speaker_preds"])
+    c_embs = torch.from_numpy(c_out["chunk_pre_encoder_embs"])
+    # c_emb_lens = torch.from_numpy(c_out["chunk_pre_encoder_lengths"]) # Check if exists
     
     print("\n--- Comparison ---")
     print(f"Preds Shape: NeMo {n_preds.shape} vs CoreML {c_preds.shape}")

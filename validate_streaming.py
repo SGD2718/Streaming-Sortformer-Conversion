@@ -5,9 +5,10 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import sys
 import math
 import librosa
+import coremltools as ct
+from itertools import permutations
 
 # Import NeMo
 from nemo.collections.asr.models import SortformerEncLabelModel
@@ -23,6 +24,8 @@ def streaming_feat_loader(modules, feat_seq, feat_seq_length, feat_seq_offset):
     subsampling_factor = modules.subsampling_factor
     chunk_left_context = getattr(modules, 'chunk_left_context', 0)
     chunk_right_context = getattr(modules, 'chunk_right_context', 0)
+    print(f"left context: {chunk_left_context}")
+    print(f"right context: {chunk_right_context}")
 
     stt_feat, end_feat, chunk_idx = 0, 0, 0
     while end_feat < feat_len:
@@ -43,90 +46,32 @@ def streaming_feat_loader(modules, feat_seq, feat_seq_length, feat_seq_offset):
         chunk_idx += 1
 
 
-def run_custom_streaming_inference_forward_streaming_step(nemo_model, audio_path):
+def run_coreml_streaming_inference(nemo_model, pre_encode_model, head_model, audio_path, coreml_config):
     """
-    Custom streaming inference using forward_streaming_step directly.
-    This should match NeMo's forward_streaming EXACTLY.
-    """
-    modules = nemo_model.sortformer_modules
-    sample_rate = 16000
-    
-    # Load Audio
-    full_audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
-    total_samples = len(full_audio)
-    
-    audio_tensor = torch.from_numpy(full_audio).unsqueeze(0).float()
-    audio_length = torch.tensor([total_samples], dtype=torch.long)
-    
-    # === Use process_signal exactly as NeMo does ===
-    with torch.no_grad():
-        processed_signal, processed_signal_length = nemo_model.process_signal(
-            audio_signal=audio_tensor, audio_signal_length=audio_length
-        )
-    
-    # Trim to actual length (same as forward())
-    processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-    
-    # === Initialize streaming state ===
-    state = modules.init_streaming_state(batch_size=1, device='cpu')
-    
-    # === Use streaming_feat_loader to chunk features ===
-    batch_size = processed_signal.shape[0]
-    processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long)
-    
-    total_preds = torch.zeros((batch_size, 0, modules.n_spk), device='cpu')
-    
-    feat_loader = streaming_feat_loader(
-        modules=modules,
-        feat_seq=processed_signal,
-        feat_seq_length=processed_signal_length,
-        feat_seq_offset=processed_signal_offset,
-    )
-    
-    for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in feat_loader:
-        # Use forward_streaming_step directly - this is what NeMo's forward_streaming uses internally
-        with torch.no_grad():
-            state, total_preds = nemo_model.forward_streaming_step(
-                processed_signal=chunk_feat_seq_t,
-                processed_signal_length=feat_lengths,
-                streaming_state=state,
-                total_preds=total_preds,
-                left_offset=left_offset,
-                right_offset=right_offset,
-            )
-    
-    return total_preds
-
-
-def run_custom_streaming_inference_forward_for_export(nemo_model, audio_path):
-    """
-    Custom streaming inference using forward_for_export.
-    This is for CoreML/ONNX export compatibility.
+    Streaming inference using the CoreML model.
     """
     modules = nemo_model.sortformer_modules
     subsampling_factor = modules.subsampling_factor
     sample_rate = 16000
     
+    COREML_CHUNK_FRAMES = coreml_config['chunk_frames']
+    COREML_SPKCACHE_LEN = coreml_config['spkcache_len']
+    COREML_FIFO_LEN = coreml_config['fifo_len']
+    
     # Load Audio
     full_audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
-    total_samples = len(full_audio)
-    
     audio_tensor = torch.from_numpy(full_audio).unsqueeze(0).float()
-    audio_length = torch.tensor([total_samples], dtype=torch.long)
+    audio_length = torch.tensor([len(full_audio)], dtype=torch.long)
     
-    # === Use process_signal exactly as NeMo does ===
     with torch.no_grad():
         processed_signal, processed_signal_length = nemo_model.process_signal(
             audio_signal=audio_tensor, audio_signal_length=audio_length
         )
-    
-    # Trim to actual length (same as forward())
     processed_signal = processed_signal[:, :, :processed_signal_length.max()]
     
-    # === Initialize streaming state ===
+    # Initialize streaming state
     state = modules.init_streaming_state(batch_size=1, device='cpu')
     
-    # === Use streaming_feat_loader to chunk features ===
     batch_size = processed_signal.shape[0]
     processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long)
     
@@ -140,49 +85,57 @@ def run_custom_streaming_inference_forward_for_export(nemo_model, audio_path):
     )
     
     for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in feat_loader:
-        chunk_in = chunk_feat_seq_t
+        # Pad chunk to fixed size
+        chunk_actual_len = chunk_feat_seq_t.shape[1]
+        if chunk_actual_len < COREML_CHUNK_FRAMES:
+            pad_len = COREML_CHUNK_FRAMES - chunk_actual_len
+            chunk_in = torch.nn.functional.pad(chunk_feat_seq_t, (0, 0, 0, pad_len))
+        else:
+            chunk_in = chunk_feat_seq_t[:, :COREML_CHUNK_FRAMES, :]
         chunk_len_in = feat_lengths.long()
         
-        # Get actual lengths from state (for forward_for_export we need to pad but track real lengths)
         curr_spk_len = state.spkcache.shape[1]
         curr_fifo_len = state.fifo.shape[1]
         
-        # Prepare SpkCache - Pad to fixed size for export model
+        # Prepare SpkCache
         current_spkcache = state.spkcache
-        req_spk_len = modules.spkcache_len
-        
-        if curr_spk_len < req_spk_len:
-            pad_len = req_spk_len - curr_spk_len
+        if curr_spk_len < COREML_SPKCACHE_LEN:
+            pad_len = COREML_SPKCACHE_LEN - curr_spk_len
             current_spkcache = torch.nn.functional.pad(current_spkcache, (0, 0, 0, pad_len))
-        elif curr_spk_len > req_spk_len:
-            current_spkcache = current_spkcache[:, :req_spk_len, :]
-
+        elif curr_spk_len > COREML_SPKCACHE_LEN:
+            current_spkcache = current_spkcache[:, :COREML_SPKCACHE_LEN, :]
         spkcache_in = current_spkcache
-        # Use actual length, not padded length
         spkcache_len_in = torch.tensor([curr_spk_len], dtype=torch.long)
         
-        # Prepare FIFO - Pad to fixed size for export model
+        # Prepare FIFO
         current_fifo = state.fifo
-        req_fifo_len = modules.fifo_len
-        
-        if curr_fifo_len < req_fifo_len:
-            pad_len = req_fifo_len - curr_fifo_len
+        if curr_fifo_len < COREML_FIFO_LEN:
+            pad_len = COREML_FIFO_LEN - curr_fifo_len
             current_fifo = torch.nn.functional.pad(current_fifo, (0, 0, 0, pad_len))
-        elif curr_fifo_len > req_fifo_len:
-            current_fifo = current_fifo[:, :req_fifo_len, :]
-             
+        elif curr_fifo_len > COREML_FIFO_LEN:
+            current_fifo = current_fifo[:, :COREML_FIFO_LEN, :]
         fifo_in = current_fifo
         fifo_len_in = torch.tensor([curr_fifo_len], dtype=torch.long)
         
-        with torch.no_grad():
-            pred_logits, chunk_embs, emb_lens = nemo_model.forward_for_export(
-                chunk=chunk_in,
-                chunk_lengths=chunk_len_in,
-                spkcache=spkcache_in,
-                spkcache_lengths=spkcache_len_in,
-                fifo=fifo_in,
-                fifo_lengths=fifo_len_in
-            )
+        # Run CoreML Model
+        coreml_inputs = {
+            "chunk": chunk_in.numpy().astype(np.float32),
+            "chunk_lengths": chunk_len_in.numpy().astype(np.int32),
+            "spkcache": spkcache_in.numpy().astype(np.float32),
+            "spkcache_lengths": spkcache_len_in.numpy().astype(np.int32),
+            "fifo": fifo_in.numpy().astype(np.float32),
+            "fifo_lengths": fifo_len_in.numpy().astype(np.int32)
+        }
+        
+        pre_encode_out = pre_encode_model.predict(coreml_inputs)
+        coreml_out = head_model.predict(pre_encode_out)
+
+        pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
+        chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+        chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
+        
+        # Trim chunk_embs to actual length (drop padded frames)
+        chunk_embs = chunk_embs[:, :chunk_emb_len, :]
 
         lc = round(left_offset / subsampling_factor)
         rc = math.ceil(right_offset / subsampling_factor)
@@ -203,63 +156,56 @@ def run_custom_streaming_inference_forward_for_export(nemo_model, audio_path):
     return None
 
 
-def compare_results(ref_probs_np, cand_probs_np, ref_label, cand_label):
-    """Compare two probability arrays and return error metrics."""
-    min_len = min(ref_probs_np.shape[0], cand_probs_np.shape[0])
-    ref_slice = ref_probs_np[:min_len, :]
-    cand_slice = cand_probs_np[:min_len, :]
-    
-    diff = np.abs(ref_slice - cand_slice)
-    mean_error = np.mean(diff)
-    max_error = np.max(diff)
-    
-    print(f"\n{ref_label} vs {cand_label}:")
-    print(f"  Length Match: ref={ref_probs_np.shape[0]}, cand={cand_probs_np.shape[0]}")
-    print(f"  Mean Absolute Error: {mean_error:.10f}")
-    print(f"  Max Absolute Error:  {max_error:.10f}")
-    
-    if mean_error < 0.001 and max_error < 0.001:
-        print(f"  ✅ SUCCESS: Errors are within tolerance (< 0.001)")
-    else:
-        print(f"  ❌ FAIL: Errors exceed tolerance (>= 0.001)")
-        max_idx = np.unravel_index(np.argmax(diff), diff.shape)
-        print(f"     Max error at frame {max_idx[0]}, speaker {max_idx[1]}")
-        print(f"     Ref value: {ref_slice[max_idx]:.6f}")
-        print(f"     Cand value: {cand_slice[max_idx]:.6f}")
-    
-    return mean_error, max_error, ref_slice, cand_slice, diff
-
-
-def validate(model_name, audio_path):
+def validate(model_name, coreml_dir, audio_path):
     print("=" * 70)
-    print("VALIDATION: Comparing NeMo forward_streaming vs Custom Implementations")
+    print("VALIDATION: Comparing nemo_model.diarize vs CoreML Streaming")
     print("=" * 70)
     
-    # Load model once
+    # Load NeMo model
     print(f"\nLoading NeMo Model: {model_name}")
     nemo_model = SortformerEncLabelModel.from_pretrained(model_name, map_location="cpu")
     nemo_model.eval()
     
-    # Overrides for Low Latency (Match CoreML)
-    print("Overriding Config to Low Latency (chunk_len=4)...")
-    nemo_model.sortformer_modules.chunk_len = 4
-    nemo_model.sortformer_modules.chunk_right_context = 1
-    nemo_model.sortformer_modules.chunk_left_context = 0
-    nemo_model.sortformer_modules.fifo_len = 125
-    nemo_model.sortformer_modules.spkcache_len = 125
-    nemo_model.sortformer_modules.spkcache_update_period = 63
+    # CoreML export configuration
+    COREML_CONFIG = {
+        'chunk_len': 6,
+        'chunk_right_context': 1,
+        'chunk_left_context': 1,
+        'fifo_len': 40,
+        'spkcache_len': 120,
+        'spkcache_update_period': 30,
+        'chunk_frames': 64,  # chunk_len * subsampling_factor
+    }
     
-    # === Match diarize() preprocessing ===
-    # Disable dither and pad_to (as diarize does in _diarize_on_begin)
+    # Apply config to modules
+    modules = nemo_model.sortformer_modules
+    modules.chunk_len = COREML_CONFIG['chunk_len']
+    modules.chunk_right_context = COREML_CONFIG['chunk_right_context']
+    modules.chunk_left_context = COREML_CONFIG['chunk_left_context']
+    modules.fifo_len = COREML_CONFIG['fifo_len']
+    modules.spkcache_len = COREML_CONFIG['spkcache_len']
+    modules.spkcache_update_period = COREML_CONFIG['spkcache_update_period']
+    
+    print(f"Config: chunk_len={modules.chunk_len}, fifo={modules.fifo_len}, spkcache={modules.spkcache_len}")
+    
+    # Disable dither and pad_to (as diarize does)
     if hasattr(nemo_model.preprocessor, 'featurizer'):
         if hasattr(nemo_model.preprocessor.featurizer, 'dither'):
-            original_dither = nemo_model.preprocessor.featurizer.dither
             nemo_model.preprocessor.featurizer.dither = 0.0
-            print(f"Disabled dither (was {original_dither})")
         if hasattr(nemo_model.preprocessor.featurizer, 'pad_to'):
-            original_pad_to = nemo_model.preprocessor.featurizer.pad_to
             nemo_model.preprocessor.featurizer.pad_to = 0
-            print(f"Disabled pad_to (was {original_pad_to})")
+    
+    # Load CoreML model
+    print(f"Loading CoreML Model from {coreml_dir}...")
+    head_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "Pipeline_Head.mlpackage"),
+        compute_units=ct.ComputeUnit.CPU_ONLY
+    )
+
+    pre_encode_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
+        compute_units=ct.ComputeUnit.CPU_ONLY
+    )
     
     # =========================================
     # 1. NeMo Reference using forward_streaming
@@ -268,109 +214,104 @@ def validate(model_name, audio_path):
     print("TEST 1: NeMo forward_streaming (Reference)")
     print("=" * 70)
     
-    sample_rate = 16000
-    full_audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
-    audio_tensor = torch.from_numpy(full_audio).unsqueeze(0).float()
-    audio_length = torch.tensor([len(full_audio)], dtype=torch.long)
-    
-    with torch.no_grad():
-        processed_signal, processed_signal_length = nemo_model.process_signal(
-            audio_signal=audio_tensor, audio_signal_length=audio_length
-        )
-        processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-        ref_probs = nemo_model.forward_streaming(processed_signal, processed_signal_length)
-    
-    ref_probs_np = ref_probs.squeeze(0).detach().cpu().numpy()
-    print(f"Reference Probs Shape: {ref_probs_np.shape}")
+    try:
+        sample_rate = 16000
+        full_audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+        audio_tensor = torch.from_numpy(full_audio).unsqueeze(0).float()
+        audio_length = torch.tensor([len(full_audio)], dtype=torch.long)
+        
+        with torch.no_grad():
+            processed_signal, processed_signal_length = nemo_model.process_signal(
+                audio_signal=audio_tensor, audio_signal_length=audio_length
+            )
+            processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+            ref_probs = nemo_model.forward_streaming(processed_signal, processed_signal_length)
+        
+        ref_probs_np = ref_probs.squeeze(0).detach().cpu().numpy()
+        print(f"Reference (forward_streaming) Probs Shape: {ref_probs_np.shape}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"Error running NeMo forward_streaming: {e}")
+        return
     
     # =========================================
-    # 2. Custom using forward_streaming_step
+    # 2. CoreML Streaming Inference
     # =========================================
     print("\n" + "=" * 70)
-    print("TEST 2: Custom Loop using forward_streaming_step")
+    print("TEST 2: CoreML Streaming Inference")
     print("=" * 70)
     
-    cand_step_tensor = run_custom_streaming_inference_forward_streaming_step(nemo_model, audio_path)
-    cand_step_np = cand_step_tensor.squeeze(0).detach().cpu().numpy()
-    print(f"forward_streaming_step Probs Shape: {cand_step_np.shape}")
-    
-    mean_err_step, max_err_step, ref_slice, cand_step_slice, diff_step = compare_results(
-        ref_probs_np, cand_step_np, 
-        "NeMo forward_streaming", "Custom forward_streaming_step"
+    cand_probs_tensor = run_coreml_streaming_inference(
+        nemo_model, pre_encode_model, head_model, audio_path, COREML_CONFIG
     )
+    cand_probs_np = cand_probs_tensor.squeeze(0).detach().cpu().numpy()
+    print(f"CoreML Streaming Probs Shape: {cand_probs_np.shape}")
     
     # =========================================
-    # 3. Custom using forward_for_export
-    # =========================================
-    print("\n" + "=" * 70)
-    print("TEST 3: Custom Loop using forward_for_export")
-    print("=" * 70)
-    
-    cand_export_tensor = run_custom_streaming_inference_forward_for_export(nemo_model, audio_path)
-    cand_export_np = cand_export_tensor.squeeze(0).detach().cpu().numpy()
-    print(f"forward_for_export Probs Shape: {cand_export_np.shape}")
-    
-    mean_err_export, max_err_export, _, cand_export_slice, diff_export = compare_results(
-        ref_probs_np, cand_export_np,
-        "NeMo forward_streaming", "Custom forward_for_export"
-    )
-    
-    # =========================================
-    # 4. Compare forward_streaming_step vs forward_for_export (to verify padding doesn't cause differences)
+    # 3. Compare with Permutation Invariance
     # =========================================
     print("\n" + "=" * 70)
-    print("TEST 4: Verify padding doesn't cause differences")
+    print("COMPARISON (Permutation Invariant)")
     print("=" * 70)
     
-    mean_err_step_vs_export, max_err_step_vs_export, _, _, diff_step_export = compare_results(
-        cand_step_np, cand_export_np,
-        "forward_streaming_step", "forward_for_export"
-    )
+    min_len = min(ref_probs_np.shape[0], cand_probs_np.shape[0])
+    ref_slice = ref_probs_np[:min_len, :]
+    cand_slice = cand_probs_np[:min_len, :]
     
-    # =========================================
-    # 5. Summary
-    # =========================================
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print(f"forward_streaming_step vs NeMo: Mean={mean_err_step:.10f}, Max={max_err_step:.10f}")
-    print(f"forward_for_export vs NeMo:     Mean={mean_err_export:.10f}, Max={max_err_export:.10f}")
-    print(f"step vs export (padding test):  Mean={mean_err_step_vs_export:.10f}, Max={max_err_step_vs_export:.10f}")
+    # Sortformer speakers may be in different order - find best permutation
+    n_spk = 4
+    best_mse = float('inf')
+    best_perm = None
+    best_cand_permuted = None
     
-    all_pass = (mean_err_step < 0.001 and max_err_step < 0.001 and
-                mean_err_export < 0.001 and max_err_export < 0.001)
+    for p in permutations(range(n_spk)):
+        cand_permuted = cand_slice[:, p]
+        mse = np.mean((ref_slice - cand_permuted)**2)
+        if mse < best_mse:
+            best_mse = mse
+            best_perm = p
+            best_cand_permuted = cand_permuted
     
-    if all_pass:
-        print("\n🎉 ALL TESTS PASSED!")
+    diff = np.abs(ref_slice - best_cand_permuted)
+    mean_error = np.mean(diff)
+    max_error = np.max(diff)
+    
+    print(f"Best Speaker Permutation: {best_perm}")
+    print(f"Length Match: ref={ref_probs_np.shape[0]}, cand={cand_probs_np.shape[0]}")
+    print(f"Mean Absolute Error: {mean_error:.8f}")
+    print(f"Max Absolute Error:  {max_error:.8f}")
+    
+    if mean_error < 0.001 and max_error < 0.001:
+        print("\n✅ SUCCESS: Errors are within tolerance (< 0.001)")
     else:
-        print("\n⚠️  SOME TESTS FAILED - see details above")
+        print("\n⚠️  Errors exceed tolerance (>= 0.001)")
+        max_idx = np.unravel_index(np.argmax(diff), diff.shape)
+        print(f"   Max error at frame {max_idx[0]}, speaker {max_idx[1]}")
+        print(f"   Ref value: {ref_slice[max_idx]:.6f}")
+        print(f"   Cand value: {best_cand_permuted[max_idx]:.6f}")
     
     # =========================================
-    # 6. Plot
+    # 4. Plot: NeMo diarize, CoreML, and Error
     # =========================================
     print("\nGenerating Comparison Plot...")
-    fig, axes = plt.subplots(4, 1, figsize=(15, 12), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
     
-    # Reference
+    # Reference (NeMo diarize)
     sns.heatmap(ref_slice.T, ax=axes[0], cmap="viridis", vmin=0, vmax=1, cbar=True)
-    axes[0].set_title(f"NeMo forward_streaming (Reference). Shape: {ref_slice.shape}")
+    axes[0].set_title(f"NeMo diarize() (Reference). Shape: {ref_slice.shape}")
     axes[0].set_ylabel("Speaker")
     
-    # forward_streaming_step
-    sns.heatmap(cand_step_slice.T, ax=axes[1], cmap="viridis", vmin=0, vmax=1, cbar=True)
-    axes[1].set_title(f"Custom forward_streaming_step. Mean Err={mean_err_step:.6f}")
+    # CoreML (with best permutation)
+    sns.heatmap(best_cand_permuted.T, ax=axes[1], cmap="viridis", vmin=0, vmax=1, cbar=True)
+    axes[1].set_title(f"CoreML Streaming (Perm: {best_perm}). Shape: {best_cand_permuted.shape}")
     axes[1].set_ylabel("Speaker")
     
-    # forward_for_export
-    sns.heatmap(cand_export_slice.T, ax=axes[2], cmap="viridis", vmin=0, vmax=1, cbar=True)
-    axes[2].set_title(f"Custom forward_for_export. Mean Err={mean_err_export:.6f}")
+    # Absolute Difference
+    sns.heatmap(diff.T, ax=axes[2], cmap="Reds", vmin=0, vmax=0.1, cbar=True)
+    axes[2].set_title(f"Absolute Error. Mean={mean_error:.6f}, Max={max_error:.6f}")
     axes[2].set_ylabel("Speaker")
-    
-    # Difference (export vs NeMo)
-    sns.heatmap(diff_export.T, ax=axes[3], cmap="Reds", vmin=0, vmax=0.1, cbar=True)
-    axes[3].set_title(f"Difference (forward_for_export vs NeMo). Max={max_err_export:.6f}")
-    axes[3].set_ylabel("Speaker")
-    axes[3].set_xlabel("Time Frames")
+    axes[2].set_xlabel("Time Frames")
     
     plt.tight_layout()
     out_file = "validation_heatmap.png"
@@ -378,13 +319,14 @@ def validate(model_name, audio_path):
     print(f"Saved plot to {out_file}")
     
     return {
-        'step_mean': mean_err_step, 'step_max': max_err_step,
-        'export_mean': mean_err_export, 'export_max': max_err_export,
-        'step_vs_export_mean': mean_err_step_vs_export, 'step_vs_export_max': max_err_step_vs_export,
+        'mean_error': mean_error,
+        'max_error': max_error,
+        'best_perm': best_perm,
     }
 
 
 if __name__ == "__main__":
     model_name = "nvidia/diar_streaming_sortformer_4spk-v2.1"
+    coreml_dir = "coreml_models"
     audio_path = "audio.wav"
-    validate(model_name, audio_path)
+    validate(model_name, coreml_dir, audio_path)

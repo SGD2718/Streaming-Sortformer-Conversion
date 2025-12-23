@@ -86,16 +86,36 @@ def run_streaming_inference(model_name, coreml_dir, audio_path):
     # --- Override Config to match CoreML Export (Low Latency) ---
     print("Overriding Config (Inference) to match CoreML...")
     modules.chunk_len = 4
-    modules.chunk_right_context = 1
-    modules.chunk_left_context = 0  # Typically 0 for low-latency streaming
-    modules.fifo_len = 125
-    modules.spkcache_len = 125
-    modules.spkcache_update_period = 63
+    modules.chunk_right_context = 1  # 1 chunk of right context
+    modules.chunk_left_context = 2   # 1 chunk of left context
+    # Match CoreML export sizes (from model spec)
+    modules.fifo_len = 63
+    modules.spkcache_len = 63
+    modules.spkcache_update_period = 50  # Match CoreML export
     
-    # CoreML Models (loaded but using NeMo for now)
+    # CoreML fixed input sizes (must match export settings)
+    # With left_context=1, right_context=1: (4+1+1)*8 = 48 frames
+    COREML_CHUNK_FRAMES = 56
+    COREML_SPKCACHE_LEN = 63
+    COREML_FIFO_LEN = 63
+    
+    # Disable dither and pad_to (as diarize does)
+    if hasattr(nemo_model.preprocessor, 'featurizer'):
+        if hasattr(nemo_model.preprocessor.featurizer, 'dither'):
+            nemo_model.preprocessor.featurizer.dither = 0.0
+        if hasattr(nemo_model.preprocessor.featurizer, 'pad_to'):
+            nemo_model.preprocessor.featurizer.pad_to = 0
+    
+    # CoreML Models - use CPU_ONLY for compatibility
     print(f"Loading CoreML Models from {coreml_dir}...")
-    preproc_model = ct.models.MLModel(os.path.join(coreml_dir, "SortformerPreprocessor.mlpackage"))
-    main_model = ct.models.MLModel(os.path.join(coreml_dir, "Sortformer.mlpackage"))
+    preproc_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "SortformerPreprocessor.mlpackage"),
+        compute_units=ct.ComputeUnit.CPU_ONLY
+    )
+    main_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "Sortformer.mlpackage"),
+        compute_units=ct.ComputeUnit.ALL
+    )
     
     # Config
     chunk_len = modules.chunk_len  # Output frames (e.g., 4 for low latency)
@@ -117,9 +137,9 @@ def run_streaming_inference(model_name, coreml_dir, audio_path):
     audio_length = torch.tensor([total_samples], dtype=torch.long)
     
     with torch.no_grad():
-        # processed_signal shape: [batch, feat_dim, feat_frames]
-        processed_signal, processed_signal_length = nemo_model.preprocessor(
-            input_signal=audio_tensor, length=audio_length
+        # Use process_signal for proper normalization (same as forward())
+        processed_signal, processed_signal_length = nemo_model.process_signal(
+            audio_signal=audio_tensor, audio_signal_length=audio_length
         )
     
     print(f"Processed signal shape: {processed_signal.shape}")  # [1, 128, T]
@@ -146,49 +166,63 @@ def run_streaming_inference(model_name, coreml_dir, audio_path):
     )
     
     for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in feat_loader:
-        # chunk_feat_seq_t: [batch, feat_frames, feat_dim] e.g., [1, 32, 128] for chunk_len=4
-        
-        # Prepare inputs for forward_for_export
-        chunk_in = chunk_feat_seq_t  # [1, T, 128]
+        # Prepare inputs for CoreML model
+        # Pad chunk to fixed size for CoreML
+        chunk_actual_len = chunk_feat_seq_t.shape[1]
+        if chunk_actual_len < COREML_CHUNK_FRAMES:
+            pad_len = COREML_CHUNK_FRAMES - chunk_actual_len
+            chunk_in = torch.nn.functional.pad(chunk_feat_seq_t, (0, 0, 0, pad_len))
+        else:
+            chunk_in = chunk_feat_seq_t[:, :COREML_CHUNK_FRAMES, :]
         chunk_len_in = feat_lengths.long()  # actual length
+
+        # Get actual lengths from state (pad tensors but track real lengths)
+        curr_spk_len = state.spkcache.shape[1]
+        curr_fifo_len = state.fifo.shape[1]
+        # Prepare SpkCache - Pad to CoreML fixed size
+        current_spkcache = state.spkcache
         
-        # Prepare SpkCache - Pad if needed
-        current_spkcache = state.spkcache  # [1, L, 512]
-        curr_spk_len = current_spkcache.shape[1]
-        req_spk_len = modules.spkcache_len
-        
-        if curr_spk_len < req_spk_len:
-            pad_len = req_spk_len - curr_spk_len
+        if curr_spk_len < COREML_SPKCACHE_LEN:
+            pad_len = COREML_SPKCACHE_LEN - curr_spk_len
             current_spkcache = torch.nn.functional.pad(current_spkcache, (0, 0, 0, pad_len))
-        elif curr_spk_len > req_spk_len:
-            current_spkcache = current_spkcache[:, :req_spk_len, :]
+        elif curr_spk_len > COREML_SPKCACHE_LEN:
+            current_spkcache = current_spkcache[:, :COREML_SPKCACHE_LEN, :]
 
         spkcache_in = current_spkcache
-        spkcache_len_in = torch.tensor([max(1, curr_spk_len)], dtype=torch.long)
+        # Use actual length, not padded length
+        spkcache_len_in = torch.tensor([curr_spk_len], dtype=torch.long)
         
-        # Prepare FIFO - Pad if needed
+        # Prepare FIFO - Pad to CoreML fixed size
         current_fifo = state.fifo
-        curr_fifo_len = current_fifo.shape[1]
-        req_fifo_len = modules.fifo_len
         
-        if curr_fifo_len < req_fifo_len:
-            pad_len = req_fifo_len - curr_fifo_len
+        if curr_fifo_len < COREML_FIFO_LEN:
+            pad_len = COREML_FIFO_LEN - curr_fifo_len
             current_fifo = torch.nn.functional.pad(current_fifo, (0, 0, 0, pad_len))
-        elif curr_fifo_len > req_fifo_len:
-            current_fifo = current_fifo[:, :req_fifo_len, :]
+        elif curr_fifo_len > COREML_FIFO_LEN:
+            current_fifo = current_fifo[:, :COREML_FIFO_LEN, :]
              
         fifo_in = current_fifo
         fifo_len_in = torch.tensor([curr_fifo_len], dtype=torch.long)
         
-        with torch.no_grad():
-            pred_logits, chunk_embs, emb_lens = nemo_model.forward_for_export(
-                chunk=chunk_in,
-                chunk_lengths=chunk_len_in,
-                spkcache=spkcache_in,
-                spkcache_lengths=spkcache_len_in,
-                fifo=fifo_in,
-                fifo_lengths=fifo_len_in
-            )
+        # === Run CoreML Model ===
+        coreml_inputs = {
+            "chunk": chunk_in.numpy().astype(np.float32),
+            "chunk_lengths": chunk_len_in.numpy().astype(np.int32),
+            "spkcache": spkcache_in.numpy().astype(np.float32),
+            "spkcache_lengths": spkcache_len_in.numpy().astype(np.int32),
+            "fifo": fifo_in.numpy().astype(np.float32),
+            "fifo_lengths": fifo_len_in.numpy().astype(np.int32)
+        }
+        
+        coreml_out = main_model.predict(coreml_inputs)
+        
+        # Convert outputs back to torch tensors
+        pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
+        chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+        chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
+        
+        # Trim chunk_embs to actual length (drop padded frames)
+        chunk_embs = chunk_embs[:, :chunk_emb_len, :]
 
         # Compute lc and rc for streaming_update (in embeddings/diar frames, not feature frames)
         # NeMo does: lc = round(left_offset / encoder.subsampling_factor)
@@ -222,7 +256,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", default="nvidia/diar_streaming_sortformer_4spk-v2.1")
     parser.add_argument("--coreml_dir", default="coreml_models")
-    parser.add_argument("--audio_path", default="audio.wav")
+    parser.add_argument("--audio_path", default="test2.wav")
     args = parser.parse_args()
     
     run_streaming_inference(args.model_name, args.coreml_dir, args.audio_path)

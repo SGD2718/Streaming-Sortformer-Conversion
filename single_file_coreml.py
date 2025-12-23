@@ -17,6 +17,7 @@ import coremltools as ct
 import librosa
 import threading
 import math
+import time
 from pydub import AudioSegment
 from pydub.playback import play as play_audio
 
@@ -53,7 +54,7 @@ def streaming_feat_loader(modules, feat_seq, feat_seq_length, feat_seq_offset):
         chunk_idx += 1
 
 
-def run_coreml_streaming(nemo_model, coreml_model, audio_path, config):
+def run_coreml_streaming(nemo_model, pre_encoder_model, head_model, audio_path, config):
     """Run streaming diarization using CoreML model."""
     modules = nemo_model.sortformer_modules
     subsampling_factor = modules.subsampling_factor
@@ -130,10 +131,20 @@ def run_coreml_streaming(nemo_model, coreml_model, audio_path, config):
         }
         
         # Run CoreML model
-        coreml_out = coreml_model.predict(coreml_inputs)
+        preenc_start = time.time()
+        pre_encoder_out = pre_encoder_model.predict(coreml_inputs)
+        preenc_end = time.time()
+        coreml_out = head_model.predict(pre_encoder_out)
+        out_end = time.time()
+        print(f"Pre-Encoder time: {preenc_end - preenc_start}")
+        print(f"Head time: {out_end - preenc_end}")
+
+        pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
+        chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+        chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
         
-        pred_logits = torch.from_numpy(coreml_out["preds"])
-        chunk_embs = torch.from_numpy(coreml_out["chunk_embs"])
+        # Trim chunk_embs to actual length (drop padded frames)
+        chunk_embs = chunk_embs[:, :chunk_emb_len, :]
         
         # Compute lc/rc for streaming update
         lc = round(left_offset / subsampling_factor)
@@ -214,17 +225,17 @@ def main():
     
     # CoreML export configuration (must match export settings)
     CONFIG = {
-        'chunk_len': 4,
-        'chunk_right_context': 0,
-        'chunk_left_context': 0,
-        'fifo_len': 188,
-        'spkcache_len': 188,
-        'spkcache_update_period': 144,
-        'chunk_frames': 32,  # chunk_len * subsampling_factor
-        'spkcache_input_len': 188,  # CoreML model input size
-        'fifo_input_len': 188,  # CoreML model input size
+        'chunk_len': 6,
+        'chunk_right_context': 1,
+        'chunk_left_context': 1,
+        'fifo_len': 40,
+        'spkcache_len': 120,
+        'spkcache_update_period': 30,
+        'chunk_frames': 64,  # (chunk_len + left_context + right_context) * subsampling_factor = (4+1+1)*8
+        'fifo_input_len': 40,  # CoreML model input size
+        'spkcache_input_len': 120,  # CoreML model input size
     }
-    
+
     # Load audio for playback
     print("Loading audio file for playback...")
     full_audio = AudioSegment.from_wav(audio_file)
@@ -252,14 +263,21 @@ def main():
     
     # --- Load CoreML model ---
     print(f"Loading CoreML Model from {coreml_dir}...")
-    coreml_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "Sortformer.mlpackage"),
+    pre_encoder_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "Pipeline_PreEncoder.mlpackage"),
         compute_units=ct.ComputeUnit.CPU_ONLY  # For compatibility
+    )
+    head_model = ct.models.MLModel(
+        os.path.join(coreml_dir, "Pipeline_Head.mlpackage"),
+        compute_units=ct.ComputeUnit.ALL  # For compatibility
     )
     
     # --- Run Inference ---
     print("Running CoreML streaming inference...")
-    probs_tensor = run_coreml_streaming(nemo_model, coreml_model, audio_file, CONFIG)
+    st_time = time.time()
+    probs_tensor = run_coreml_streaming(nemo_model, pre_encoder_model, head_model, audio_file, CONFIG)
+    ed_time = time.time()
+    print(f'duration: {ed_time - st_time}')
     
     if probs_tensor is None:
         print("Inference failed!")

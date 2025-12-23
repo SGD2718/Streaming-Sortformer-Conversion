@@ -482,7 +482,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         This function performs the following steps:
         1. Moves the audio signal to the correct device.
         2. Normalizes the time-series audio signal.
-        3. Extrac audio feature from from the time-series audio signal using the model's preprocessor.
+        3. Extrac audio feature from the time-series audio signal using the model's preprocessor.
 
         Args:
             audio_signal (torch.Tensor): The input audio signal.

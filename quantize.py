@@ -316,7 +316,7 @@ def plot_results(benchmark_data: Dict, output_path: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--coreml-dir", type=Path, default=Path("coreml_models"))
-    parser.add_argument("--audio-path", type=Path, default=Path("../multispeaker.wav"))
+    parser.add_argument("--audio-path", type=Path, default=Path("multispeaker.wav"))
     parser.add_argument("--model-name", type=str, default="nvidia/diar_streaming_sortformer_4spk-v2.1")
     parser.add_argument("--skip-gen", action="store_true")
     args = parser.parse_args()
