@@ -308,7 +308,7 @@ def run_mic_inference(model_name, coreml_dir):
     # Start microphone
     mic = MicrophoneStream(
         sample_rate=Config.sample_rate,
-        chunk_size=Config.sample_rate * Config.frame_duration,
+        chunk_size=int(Config.sample_rate * Config.frame_duration),
         audio_queue=audio_queue
     )
 
@@ -426,7 +426,7 @@ def run_file_demo(model_name, coreml_dir, audio_path):
     fig, ax = plt.subplots(figsize=(14, 4))
 
     # Simulate streaming
-    chunk_size = Config.sample_rate * Config.frame_duration
+    chunk_size = int(Config.sample_rate * Config.frame_duration)
     offset = 0
 
     print("\nStreaming audio with live plot...")
