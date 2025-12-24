@@ -18,30 +18,31 @@ import math
 
 # Import NeMo for state management (streaming_update) only
 from nemo.collections.asr.models import SortformerEncLabelModel
+from config import Config
 
 
 # ============================================================
 # Configuration for Sortformer16.mlpackage
 # ============================================================
 CONFIG = {
-    'chunk_len': 4,                  # Diarization chunk length
-    'chunk_right_context': 1,        # Right context chunks
-    'chunk_left_context': 2,         # Left context chunks
-    'fifo_len': 63,
-    'spkcache_len': 63,
-    'spkcache_update_period': 50,
-    'subsampling_factor': 8,
-    'sample_rate': 16000,
+    'chunk_len': Config.chunk_frames,                  # Diarization chunk length
+    'chunk_right_context': Config.chunk_right_context,        # Right context chunks
+    'chunk_left_context': Config.chunk_left_context,         # Left context chunks
+    'fifo_len': Config.fifo_len,
+    'spkcache_len': Config.spkcache_len,
+    'spkcache_update_period': Config.spkcache_update_period,
+    'subsampling_factor': Config.subsampling_factor,
+    'sample_rate': Config.sample_rate,
     
     # Derived values
-    'chunk_frames': 56,              # (4+2+1)*8 = 56 feature frames for CoreML input
-    'spkcache_input_len': 63,
-    'fifo_input_len': 63,
+    'chunk_frames': Config.chunk_frames,              # (4+2+1)*8 = 56 feature frames for CoreML input
+    'spkcache_input_len': Config.spkcache_len,
+    'fifo_input_len': Config.fifo_len,
     
     # Preprocessor settings
-    'preproc_audio_samples': 9200,   # CoreML preprocessor fixed input size
-    'mel_window': 400,               # 25ms @ 16kHz
-    'mel_stride': 160,               # 10ms @ 16kHz
+    'preproc_audio_samples': Config.coreml_audio_samples,   # CoreML preprocessor fixed input size
+    'mel_window': Config.mel_window,               # 25ms @ 16kHz
+    'mel_stride': Config.mel_stride,               # 10ms @ 16kHz
 }
 
 

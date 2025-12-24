@@ -83,8 +83,92 @@ class MicrophoneStream:
         print("Microphone stopped.")
 
 
+class StreamingPredictionBuffer:
+    """
+    Manages provisional predictions from right context that get replaced 
+    with the actual core predictions on the next chunk update.
+    
+    Timeline example (chunk_len=6, right_context=7):
+    - Chunk 0: core = frames 0-5, provisional = frames 6-12 (early guess)
+    - Chunk 1: core = frames 6-11, provisional = frames 12-18
+      → frames 6-11 were provisional, now replaced with actual core predictions
+      → frames 12-18 are new provisional
+    
+    This gives lower perceived latency: provisional frames display immediately,
+    then get replaced with proper predictions when processed as core.
+    """
+    
+    def __init__(self, num_speakers=4):
+        self.num_speakers = num_speakers
+        self.display_probs = []  # All predictions to display (confirmed + provisional)
+        self.confirmed_frame_count = 0  # Number of frames with confirmed (core) predictions
+        self.provisional_frame_count = 0  # Current number of provisional frames displayed
+        
+    def update(self, core_probs: np.ndarray, provisional_probs: np.ndarray = None):
+        """
+        Update the buffer with new predictions.
+        
+        Args:
+            core_probs: Actual predictions for the core chunk [T_core, num_speakers]
+            provisional_probs: Early guess predictions for right context [T_rc, num_speakers]
+        """
+        if len(core_probs) == 0:
+            return
+        
+        # Remove old provisional predictions (the last array if provisional_frame_count > 0)
+        if self.provisional_frame_count > 0 and len(self.display_probs) > 0:
+            self.display_probs.pop()  # Remove the provisional array
+        
+        # Add core predictions as confirmed
+        self.display_probs.append(core_probs)
+        self.confirmed_frame_count += len(core_probs)
+        
+        # Add provisional predictions for display (will be replaced next update)
+        if provisional_probs is not None and len(provisional_probs) > 0:
+            self.display_probs.append(provisional_probs)
+            self.provisional_frame_count = len(provisional_probs)
+        else:
+            self.provisional_frame_count = 0
+    
+    def get_all_probs(self, include_provisional=True):
+        """
+        Get all accumulated probabilities.
+        
+        Args:
+            include_provisional: If True, include provisional predictions
+            
+        Returns:
+            numpy array of shape [total_frames, num_speakers]
+        """
+        if len(self.display_probs) == 0:
+            return None
+        
+        all_probs = np.concatenate(self.display_probs, axis=0)
+        
+        if not include_provisional and self.provisional_frame_count > 0:
+            return all_probs[:-self.provisional_frame_count]
+        
+        return all_probs
+    
+    def get_confirmed_count(self):
+        """Return count of confirmed (core) frames."""
+        return self.confirmed_frame_count
+    
+    @property
+    def provisional_frames(self):
+        """Number of provisional frames currently displayed."""
+        return self.provisional_frame_count
+    
+    def get_total_count(self, include_provisional=True):
+        """Return total frame count."""
+        total = self.confirmed_frame_count
+        if include_provisional:
+            total += self.provisional_frame_count
+        return total
+
+
 class StreamingDiarizer:
-    """Real-time streaming diarization using CoreML."""
+    """Real-time streaming diarization using CoreML with provisional predictions."""
 
     def __init__(self, nemo_model, preproc_model, main_model):
         self.modules = nemo_model.sortformer_modules
@@ -100,21 +184,24 @@ class StreamingDiarizer:
 
         # Diarization state
         self.state = self.modules.init_streaming_state(batch_size=1, device='cpu')
-        self.all_probs = []  # List of [T, 4] arrays
+        
+        # NEW: Use prediction buffer with provisional support
+        self.pred_buffer = StreamingPredictionBuffer(num_speakers=4)
+        self.all_probs = []  # Keep for backward compatibility
 
         # Chunk tracking
         self.diar_chunk_idx = 0
-        self.preproc_chunk_idx = 0
-
+        
         # Derived params
         self.subsampling = Config.subsampling_factor
         self.core_frames = Config.chunk_len * self.subsampling
         self.left_ctx = Config.chunk_left_context * self.subsampling
         self.right_ctx = Config.chunk_right_context * self.subsampling
 
-        # Audio hop for preprocessor
-        self.audio_hop = Config.preproc_audio_samples - Config.mel_window
-        self.overlap_frames = (Config.mel_window - Config.mel_stride) // Config.mel_stride + 1
+        # Audio processing params
+        self.coreml_audio_size = Config.coreml_audio_samples  # What CoreML expects (18160)
+        self.audio_hop = Config.preproc_audio_hop  # New audio per update (~480ms = 7680)
+        self.first_run_done = False  # Track first preprocessing run
 
     def add_audio(self, audio_chunk):
         """Add new audio samples."""
@@ -123,35 +210,58 @@ class StreamingDiarizer:
     def process(self):
         """
         Process available audio through preprocessor and diarizer.
-        Returns new probability frames if available.
+        Returns new probability frames if available (including provisional).
+        
+        Sliding window preprocessing for ~2Hz updates:
+        - First run: Wait for coreml_audio_size samples (full window)
+        - After: Run every audio_hop samples using sliding window
         """
         new_probs = None
 
-        # Step 1: Run preprocessor on available audio
-        while len(self.audio_buffer) >= Config.preproc_audio_samples:
-            audio_chunk = self.audio_buffer[:Config.preproc_audio_samples]
-
+        # Step 1: Run preprocessor with sliding window
+        total_audio = len(self.audio_buffer)
+        
+        # Always need coreml_audio_size samples to run
+        # After first run, we keep (coreml_audio_size - audio_hop) samples,
+        # so we need audio_hop new samples to reach coreml_audio_size again
+        run_threshold = self.coreml_audio_size
+        
+        while total_audio >= run_threshold:
+            # Use the most recent coreml_audio_size samples
+            audio_chunk = self.audio_buffer[-self.coreml_audio_size:].copy()
+            
             preproc_inputs = {
                 "audio_signal": audio_chunk.reshape(1, -1).astype(np.float32),
-                "length": np.array([Config.preproc_audio_samples], dtype=np.int32)
+                "length": np.array([self.coreml_audio_size], dtype=np.int32)
             }
 
             preproc_out = self.preproc_model.predict(preproc_inputs)
             feat_chunk = np.array(preproc_out["features"])
             feat_len = int(preproc_out["feature_lengths"][0])
 
-            if self.preproc_chunk_idx == 0:
+            if not self.first_run_done:
+                # First run: take all features
                 valid_feats = feat_chunk[:, :, :feat_len]
+                self.first_run_done = True
             else:
-                valid_feats = feat_chunk[:, :, self.overlap_frames:feat_len]
-
+                # Subsequent runs: only take the new features
+                # audio_hop samples = audio_hop / mel_stride feature frames
+                new_feat_count = self.audio_hop // Config.mel_stride
+                valid_feats = feat_chunk[:, :, feat_len - new_feat_count:feat_len]
+            
             if self.feature_buffer is None:
                 self.feature_buffer = valid_feats
             else:
                 self.feature_buffer = np.concatenate([self.feature_buffer, valid_feats], axis=2)
 
-            self.audio_buffer = self.audio_buffer[self.audio_hop:]
-            self.preproc_chunk_idx += 1
+            # Remove processed audio (keep only what we need for next sliding window)
+            keep_samples = self.coreml_audio_size - self.audio_hop
+            if len(self.audio_buffer) > keep_samples:
+                self.audio_buffer = self.audio_buffer[-keep_samples:]
+            
+            # Update for next iteration
+            total_audio = len(self.audio_buffer)
+            run_threshold = self.coreml_audio_size
 
         if self.feature_buffer is None:
             return None
@@ -164,15 +274,17 @@ class StreamingDiarizer:
             chunk_start = self.diar_chunk_idx * self.core_frames
             chunk_end = chunk_start + self.core_frames
 
-            # Need right context
-            required_features = chunk_end + self.right_ctx
-
+            # RIGHT CONTEXT CREATES LATENCY:
+            # We need core + full right_ctx features before we can output CONFIRMED predictions
+            # Confirmed predictions are always right_ctx frames BEHIND the latest audio
+            required_features = chunk_end + self.right_ctx  # Need full right context
+            
             if required_features > total_features:
-                break  # Not enough features yet
+                break  # Not enough features yet - wait for more audio
 
-            # Extract with context
+            # We have full context - extract with full left and right context
             left_offset = min(self.left_ctx, chunk_start)
-            right_offset = min(self.right_ctx, total_features - chunk_end)
+            right_offset = self.right_ctx  # Always full right context now
 
             feat_start = chunk_start - left_offset
             feat_end = chunk_end + right_offset
@@ -184,7 +296,7 @@ class StreamingDiarizer:
             # Transpose to [B, T, D]
             chunk_t = chunk_feat_tensor.transpose(1, 2)
 
-            # Pad if needed
+            # Pad to full chunk_frames (handles partial right context)
             if actual_len < Config.chunk_frames:
                 pad_len = Config.chunk_frames - actual_len
                 chunk_in = torch.nn.functional.pad(chunk_t, (0, 0, 0, pad_len))
@@ -224,7 +336,7 @@ class StreamingDiarizer:
             st_time = time.time_ns()
             coreml_out = self.main_model.predict(coreml_inputs)
             ed_time = time.time_ns()
-            print(f"duration: {1e-6 * (ed_time - st_time)}")
+            print(f"duration: {1e-6 * (ed_time - st_time):.2f}ms")
 
             pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
             chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
@@ -233,8 +345,25 @@ class StreamingDiarizer:
             chunk_embs = chunk_embs[:, :chunk_emb_len, :]
 
             lc = round(left_offset / self.subsampling)
-            rc = math.ceil(right_offset / self.subsampling)
+            rc = Config.chunk_right_context  # Always 7 now since we wait for full right context
 
+            # Get state lengths for indexing into predictions
+            spkcache_len = self.state.spkcache.shape[1]
+            fifo_len = self.state.fifo.shape[1]
+            core_len = Config.chunk_len  # 6
+            
+            # Extract core predictions (confirmed) and right context predictions (provisional)
+            core_start = spkcache_len + fifo_len + lc
+            core_end = core_start + core_len
+            rc_end = core_end + rc  # Full 7 provisional frames
+            
+            # Core predictions - confirmed, always 6 frames behind right context
+            core_probs = pred_logits[0, core_start:core_end, :].detach().cpu().numpy()
+            
+            # Provisional predictions - always 7 frames (full right context)
+            provisional_probs = pred_logits[0, core_end:rc_end, :].detach().cpu().numpy()
+
+            # Update streaming state
             self.state, chunk_probs = self.modules.streaming_update(
                 streaming_state=self.state,
                 chunk=chunk_embs,
@@ -243,7 +372,10 @@ class StreamingDiarizer:
                 rc=rc
             )
 
-            # Store probabilities
+            # Update the prediction buffer with core and provisional predictions
+            self.pred_buffer.update(core_probs, provisional_probs)
+            
+            # Also maintain backward compatibility with all_probs list
             probs_np = chunk_probs.squeeze(0).detach().cpu().numpy()
             self.all_probs.append(probs_np)
 
@@ -252,8 +384,18 @@ class StreamingDiarizer:
 
         return new_probs
 
-    def get_all_probs(self):
-        """Get all accumulated probabilities."""
+    def get_all_probs(self, include_provisional=True):
+        """
+        Get all accumulated probabilities.
+        
+        Args:
+            include_provisional: If True, include provisional predictions from right context
+                               These are shown with lower latency but may be refined later
+        """
+        return self.pred_buffer.get_all_probs(include_provisional=include_provisional)
+    
+    def get_all_probs_legacy(self):
+        """Get all accumulated probabilities (legacy method without provisional)."""
         if len(self.all_probs) > 0:
             return np.concatenate(self.all_probs, axis=0)
         return None
@@ -318,6 +460,8 @@ def run_mic_inference(model_name, coreml_dir):
     # Setup plot
     plt.ion()
     fig, ax = plt.subplots(figsize=(14, 4))
+    im = None  # Will hold the imshow image object
+    vline = None  # Will hold the provisional marker line
 
     print("\nListening... Press Ctrl+C to stop.\n")
 
@@ -333,34 +477,57 @@ def run_mic_inference(model_name, coreml_dir):
             # Process
             new_probs = diarizer.process()
 
-            # Update plot periodically
-            if time.time() - last_update > 0.16:  # Update every 160ms
-                all_probs = diarizer.get_all_probs()
+            # Update plot - use fast imshow instead of slow heatmap
+            current_time = time.time()
+            if current_time - last_update > 0.1:  # Update every 100ms (10Hz max)
+                all_probs = diarizer.get_all_probs(include_provisional=True)
+                confirmed_count = diarizer.pred_buffer.get_confirmed_count()
+                provisional_count = diarizer.pred_buffer.provisional_frames
 
                 if all_probs is not None and len(all_probs) > 0:
-                    ax.clear()
-
                     # Show last 200 frames (~16 seconds)
                     display_frames = min(200, len(all_probs))
                     display_probs = all_probs[-display_frames:]
+                    
+                    # Calculate where provisional predictions start
+                    total_frames = len(all_probs)
+                    display_start = total_frames - display_frames
+                    provisional_start_in_display = max(0, confirmed_count - display_start)
 
-                    sns.heatmap(
-                        display_probs.T,
-                        ax=ax,
-                        cmap="viridis",
-                        vmin=0, vmax=1,
-                        yticklabels=[f"Spk {i}" for i in range(4)],
-                        cbar=False
-                    )
+                    # Initialize or update the image
+                    if im is None:
+                        ax.clear()
+                        im = ax.imshow(display_probs.T, aspect='auto', cmap='viridis', 
+                                       vmin=0, vmax=1, interpolation='nearest')
+                        ax.set_yticks(range(4))
+                        ax.set_yticklabels([f"Spk {i}" for i in range(4)])
+                        ax.set_xlabel("Time (frames, 80ms each)")
+                        ax.set_ylabel("Speaker")
+                    else:
+                        # Fast update - just change the data
+                        im.set_data(display_probs.T)
+                        im.set_extent([0, display_frames, 3.5, -0.5])
+                    
+                    # Update or create provisional marker line
+                    if provisional_count > 0 and provisional_start_in_display < display_frames:
+                        if vline is not None:
+                            vline.set_xdata([provisional_start_in_display, provisional_start_in_display])
+                        else:
+                            vline = ax.axvline(x=provisional_start_in_display, color='red', 
+                                               linestyle='--', linewidth=2, alpha=0.8)
+                    elif vline is not None:
+                        vline.set_xdata([-10, -10])  # Hide it off-screen
+                    
+                    # Update title
+                    title = f"Live Diarization - Confirmed: {confirmed_count} | "
+                    title += f"Provisional: {provisional_count} | "
+                    title += f"Total: {len(all_probs)} frames ({len(all_probs) * 0.08:.1f}s)"
+                    ax.set_title(title)
 
-                    ax.set_xlabel("Time (frames, 80ms each)")
-                    ax.set_ylabel("Speaker")
-                    ax.set_title(f"Live Diarization - Total: {len(all_probs)} frames ({len(all_probs) * 0.08:.1f}s)")
+                    fig.canvas.draw_idle()
+                    fig.canvas.flush_events()
 
-                    plt.draw()
-                    plt.pause(0.01)
-
-                last_update = time.time()
+                last_update = current_time
 
             time.sleep(0.01)
 
@@ -372,9 +539,12 @@ def run_mic_inference(model_name, coreml_dir):
         plt.close()
 
     # Final summary
-    all_probs = diarizer.get_all_probs()
+    all_probs = diarizer.get_all_probs(include_provisional=False)  # Final = confirmed only
+    provisional_count = diarizer.pred_buffer.provisional_frames
     if all_probs is not None:
-        print(f"\nTotal processed: {len(all_probs)} frames ({len(all_probs) * 0.08:.1f} seconds)")
+        print(f"\nTotal confirmed: {len(all_probs)} frames ({len(all_probs) * 0.08:.1f} seconds)")
+        if provisional_count > 0:
+            print(f"(Plus {provisional_count} provisional frames that were not yet refined)")
 
 
 def run_file_demo(model_name, coreml_dir, audio_path):
