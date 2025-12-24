@@ -210,6 +210,18 @@ def export_pipeline(
             compute_precision=get_precision(preproc_precision),
             compute_units=ct.ComputeUnit.ALL
         )
+        preproc_mlmodel.author = 'Benjamin Lee'
+        preproc_mlmodel.license = 'MIT'
+        preproc_mlmodel.version = '2.1'
+        preproc_mlmodel.short_description = "Mel Spectrogram preprocessor for Nvidia's Streaming Sortformer."
+        preproc_mlmodel.user_defined_metadata['mel_Window'] = str(Config.mel_window)
+        preproc_mlmodel.user_defined_metadata['mel_stride'] = str(Config.mel_stride)
+        preproc_mlmodel.user_defined_metadata['mel_features'] = str(feat_dim)
+        preproc_mlmodel.user_defined_metadata['chunk_audio_samples'] = str(audio_samples)
+        preproc_mlmodel.input_description['audio_signal'] = "Raw audio signal"
+        preproc_mlmodel.input_description['length'] = "Length of the audio signal to process"
+        preproc_mlmodel.output_description['features'] = "Mel spectrogram features"
+        preproc_mlmodel.output_description['feature_lengths'] = "Length of the mel spectrogram"
         preproc_mlmodel.save(os.path.join(output_dir, "SortformerPreprocessor.mlpackage"))
         print("  Saved SortformerPreprocessor.mlpackage")
 
@@ -296,6 +308,31 @@ def export_pipeline(
             )
 
             # Save the pipeline
+            pipeline_model.author = "Benjamin Lee"
+            pipeline_model.license = "MIT"
+            pipeline_model.version = '2.1'
+            pipeline_model.short_description = "CoreML port of Nvidia's Streaming Sortformer diarization model"
+            pipeline_model.user_defined_metadata['chunk_len'] = str(Config.chunk_len)
+            pipeline_model.user_defined_metadata['chunk_left_context'] = str(Config.chunk_left_context)
+            pipeline_model.user_defined_metadata['chunk_right_context'] = str(Config.chunk_right_context)
+            pipeline_model.user_defined_metadata['fifo_len'] = str(Config.fifo_len)
+            pipeline_model.user_defined_metadata['spkcache_len'] = str(Config.spkcache_len)
+            pipeline_model.user_defined_metadata['spkcache_update_period'] = str(Config.spkcache_update_period)
+            pipeline_model.user_defined_metadata['subsampling_factor'] = str(Config.subsampling_factor)
+            pipeline_model.user_defined_metadata['frame_duration'] = str(Config.frame_duration)
+            pipeline_model.user_defined_metadata['mel_feature_frames'] = str(Config.preproc_feature_frames)
+
+            pipeline_model.input_description['chunk'] = "Mel spectrogram features for the new chunk"
+            pipeline_model.input_description['chunk_lengths'] = "Length of the new chunk"
+            pipeline_model.input_description['spkcache'] = "Order of Arrival Speaker Cache"
+            pipeline_model.input_description['spkcache_lengths'] = "Length of the speaker cache (in frames)"
+            pipeline_model.input_description['fifo'] = "First-In-First-Out speech queue"
+            pipeline_model.input_description['fifo_lengths'] = "Length of the FIFO queue (in frames)"
+
+            pipeline_model.output_description['speaker_preds'] = ("Combined speaker probabilities for the speaker "
+                                                                  " cache, FIFO queue, and chunk")
+            pipeline_model.output_description['chunk_pre_encoder_embs'] = "Speaker embeddings for the new chunk"
+            pipeline_model.output_description['chunk_pre_encoder_lengths'] = "Number of frames for the new chunk"
             pipeline_model.save(os.path.join(output_dir, "SortformerPipeline.mlpackage"))
             print("  Saved SortformerPipeline.mlpackage (PreEncoder + Conformer + Transformer)")
         except Exception as e:
