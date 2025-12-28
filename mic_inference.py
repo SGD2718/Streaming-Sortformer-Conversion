@@ -219,16 +219,10 @@ class StreamingDiarizer:
         new_probs = None
 
         # Step 1: Run preprocessor with sliding window
-        total_audio = len(self.audio_buffer)
-        
-        # Always need coreml_audio_size samples to run
-        # After first run, we keep (coreml_audio_size - audio_hop) samples,
-        # so we need audio_hop new samples to reach coreml_audio_size again
-        run_threshold = self.coreml_audio_size
-        
-        while total_audio >= run_threshold:
-            # Use the most recent coreml_audio_size samples
-            audio_chunk = self.audio_buffer[-self.coreml_audio_size:].copy()
+        # Take audio from the BEGINNING of the buffer (not end) to avoid edge effects
+        while len(self.audio_buffer) >= self.coreml_audio_size:
+            # Take the first coreml_audio_size samples
+            audio_chunk = self.audio_buffer[:self.coreml_audio_size].copy()
             
             preproc_inputs = {
                 "audio_signal": audio_chunk.reshape(1, -1).astype(np.float32),
@@ -244,8 +238,8 @@ class StreamingDiarizer:
                 valid_feats = feat_chunk[:, :, :feat_len]
                 self.first_run_done = True
             else:
-                # Subsequent runs: only take the new features
-                # audio_hop samples = audio_hop / mel_stride feature frames
+                # Subsequent runs: take the LAST new_feat_count features
+                # These correspond to the new audio at the end of the chunk
                 new_feat_count = self.audio_hop // Config.mel_stride
                 valid_feats = feat_chunk[:, :, feat_len - new_feat_count:feat_len]
             
@@ -254,14 +248,8 @@ class StreamingDiarizer:
             else:
                 self.feature_buffer = np.concatenate([self.feature_buffer, valid_feats], axis=2)
 
-            # Remove processed audio (keep only what we need for next sliding window)
-            keep_samples = self.coreml_audio_size - self.audio_hop
-            if len(self.audio_buffer) > keep_samples:
-                self.audio_buffer = self.audio_buffer[-keep_samples:]
-            
-            # Update for next iteration
-            total_audio = len(self.audio_buffer)
-            run_threshold = self.coreml_audio_size
+            # Slide the window forward by removing audio_hop samples from the start
+            self.audio_buffer = self.audio_buffer[self.audio_hop:]
 
         if self.feature_buffer is None:
             return None
@@ -347,23 +335,7 @@ class StreamingDiarizer:
             lc = round(left_offset / self.subsampling)
             rc = Config.chunk_right_context  # Always 7 now since we wait for full right context
 
-            # Get state lengths for indexing into predictions
-            spkcache_len = self.state.spkcache.shape[1]
-            fifo_len = self.state.fifo.shape[1]
-            core_len = Config.chunk_len  # 6
-            
-            # Extract core predictions (confirmed) and right context predictions (provisional)
-            core_start = spkcache_len + fifo_len + lc
-            core_end = core_start + core_len
-            rc_end = core_end + rc  # Full 7 provisional frames
-            
-            # Core predictions - confirmed, always 6 frames behind right context
-            core_probs = pred_logits[0, core_start:core_end, :].detach().cpu().numpy()
-            
-            # Provisional predictions - always 7 frames (full right context)
-            provisional_probs = pred_logits[0, core_end:rc_end, :].detach().cpu().numpy()
-
-            # Update streaming state
+            # Update streaming state - this returns the properly extracted chunk predictions
             self.state, chunk_probs = self.modules.streaming_update(
                 streaming_state=self.state,
                 chunk=chunk_embs,
@@ -372,14 +344,35 @@ class StreamingDiarizer:
                 rc=rc
             )
 
+            # Use chunk_probs from streaming_update as our core (confirmed) predictions
+            # This is what NeMo's forward_streaming uses, ensuring consistency
+            core_probs = chunk_probs.squeeze(0).detach().cpu().numpy()
+
+            # For provisional predictions (tentative display only), extract right context
+            # These are early guesses that will be replaced when processed as core
+            spkcache_len = self.state.spkcache.shape[1]
+            fifo_len = self.state.fifo.shape[1]
+            core_len = Config.chunk_len  # 6
+            # Note: After streaming_update, fifo has been updated, so we use pre-update lengths
+            # Actually, we need to extract from pred_logits using the indices BEFORE the update
+            # The right context predictions are at: spkcache_len + fifo_len + lc + core_len : ... + rc
+            # But since fifo was just updated, we need to compute from original lengths
+            # Let's compute based on the prediction tensor structure
+            pred_len = pred_logits.shape[1]
+            core_start = pred_len - lc - core_len - rc + lc  # This is complex due to state changes
+            
+            # Simpler approach: provisional predictions are the right context portion
+            # which starts at (total_pred_len - rc) and goes to end
+            rc_start = pred_len - rc
+            provisional_probs = pred_logits[0, rc_start:, :].detach().cpu().numpy()
+
             # Update the prediction buffer with core and provisional predictions
             self.pred_buffer.update(core_probs, provisional_probs)
             
             # Also maintain backward compatibility with all_probs list
-            probs_np = chunk_probs.squeeze(0).detach().cpu().numpy()
-            self.all_probs.append(probs_np)
+            self.all_probs.append(core_probs)
 
-            new_probs = probs_np
+            new_probs = core_probs
             self.diar_chunk_idx += 1
 
         return new_probs
@@ -393,6 +386,130 @@ class StreamingDiarizer:
                                These are shown with lower latency but may be refined later
         """
         return self.pred_buffer.get_all_probs(include_provisional=include_provisional)
+    
+    def process_remaining(self):
+        """
+        Process any remaining audio that didn't fill a complete preprocessing chunk.
+        Call this at end-of-file to extract final features.
+        """
+        if len(self.audio_buffer) == 0 or not self.first_run_done:
+            return
+        
+        overlap_samples = self.coreml_audio_size - self.audio_hop  # 10480
+        new_samples = len(self.audio_buffer) - overlap_samples
+        
+        if new_samples > 0:
+            # Pad the audio buffer to coreml_audio_size
+            actual_len = len(self.audio_buffer)
+            audio_chunk = np.pad(self.audio_buffer, (0, self.coreml_audio_size - actual_len))
+            
+            preproc_inputs = {
+                "audio_signal": audio_chunk.reshape(1, -1).astype(np.float32),
+                "length": np.array([actual_len], dtype=np.int32)
+            }
+            
+            preproc_out = self.preproc_model.predict(preproc_inputs)
+            feat_chunk = np.array(preproc_out["features"])
+            feat_len = int(preproc_out["feature_lengths"][0])
+            
+            if feat_len > 0:
+                # Skip the overlapping features, take only new ones
+                skip_features = overlap_samples // Config.mel_stride  # 65
+                new_feat_count = feat_len - skip_features
+                if new_feat_count > 0:
+                    valid_feats = feat_chunk[:, :, skip_features:feat_len]
+                    if self.feature_buffer is None:
+                        self.feature_buffer = valid_feats
+                    else:
+                        self.feature_buffer = np.concatenate([self.feature_buffer, valid_feats], axis=2)
+    
+    def process_final(self):
+        """
+        Final pass: process any remaining features with partial right context.
+        Call this at end-of-file after process_remaining().
+        """
+        if self.feature_buffer is None:
+            return
+        
+        total_features = self.feature_buffer.shape[2]
+        
+        while True:
+            chunk_start = self.diar_chunk_idx * self.core_frames
+            chunk_end = chunk_start + self.core_frames
+            
+            if chunk_start >= total_features:
+                break  # No more core frames to process
+            
+            # At end of audio, use whatever right context is available
+            chunk_end = min(chunk_end, total_features)
+            left_offset = min(self.left_ctx, chunk_start)
+            right_offset = min(self.right_ctx, total_features - chunk_end)
+            
+            feat_start = chunk_start - left_offset
+            feat_end = chunk_end + right_offset
+            
+            chunk_feat = self.feature_buffer[:, :, feat_start:feat_end]
+            chunk_feat_tensor = torch.from_numpy(chunk_feat).float()
+            actual_len = chunk_feat.shape[2]
+            
+            chunk_t = chunk_feat_tensor.transpose(1, 2)
+            
+            if actual_len < Config.chunk_frames:
+                pad_len = Config.chunk_frames - actual_len
+                chunk_in = torch.nn.functional.pad(chunk_t, (0, 0, 0, pad_len))
+            else:
+                chunk_in = chunk_t[:, :Config.chunk_frames, :]
+            
+            curr_spk_len = self.state.spkcache.shape[1]
+            curr_fifo_len = self.state.fifo.shape[1]
+            
+            current_spkcache = self.state.spkcache
+            if curr_spk_len < Config.spkcache_len:
+                current_spkcache = torch.nn.functional.pad(
+                    current_spkcache, (0, 0, 0, Config.spkcache_len - curr_spk_len)
+                )
+            elif curr_spk_len > Config.spkcache_len:
+                current_spkcache = current_spkcache[:, :Config.spkcache_len, :]
+            
+            current_fifo = self.state.fifo
+            if curr_fifo_len < Config.fifo_len:
+                current_fifo = torch.nn.functional.pad(
+                    current_fifo, (0, 0, 0, Config.fifo_len - curr_fifo_len)
+                )
+            elif curr_fifo_len > Config.fifo_len:
+                current_fifo = current_fifo[:, :Config.fifo_len, :]
+            
+            coreml_inputs = {
+                "chunk": chunk_in.numpy().astype(np.float32),
+                "chunk_lengths": np.array([actual_len], dtype=np.int32),
+                "spkcache": current_spkcache.numpy().astype(np.float32),
+                "spkcache_lengths": np.array([curr_spk_len], dtype=np.int32),
+                "fifo": current_fifo.numpy().astype(np.float32),
+                "fifo_lengths": np.array([curr_fifo_len], dtype=np.int32)
+            }
+            
+            coreml_out = self.main_model.predict(coreml_inputs)
+            
+            pred_logits = torch.from_numpy(coreml_out["speaker_preds"])
+            chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+            chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
+            chunk_embs = chunk_embs[:, :chunk_emb_len, :]
+            
+            lc = round(left_offset / self.subsampling)
+            rc = math.ceil(right_offset / self.subsampling)
+            
+            self.state, chunk_probs = self.modules.streaming_update(
+                streaming_state=self.state,
+                chunk=chunk_embs,
+                preds=pred_logits,
+                lc=lc,
+                rc=rc
+            )
+            
+            core_probs = chunk_probs.squeeze(0).detach().cpu().numpy()
+            self.pred_buffer.update(core_probs, None)  # No provisional for final pass
+            self.all_probs.append(core_probs)
+            self.diar_chunk_idx += 1
     
     def get_all_probs_legacy(self):
         """Get all accumulated probabilities (legacy method without provisional)."""
@@ -548,10 +665,15 @@ def run_mic_inference(model_name, coreml_dir):
 
 
 def run_file_demo(model_name, coreml_dir, audio_path):
-    """Run demo on audio file with live updating plot."""
+    """
+    Run demo on audio file using NeMo preprocessing + CoreML inference.
+    
+    This uses NeMo's preprocessing and feature loader for proper feature alignment,
+    ensuring the final predictions match what NeMo's forward_streaming produces.
+    """
 
     print("=" * 70)
-    print("File Demo with Live Updating Plot")
+    print("File Demo with NeMo-Aligned CoreML Inference")
     print("=" * 70)
 
     # Load NeMo model
@@ -559,7 +681,7 @@ def run_file_demo(model_name, coreml_dir, audio_path):
     nemo_model = SortformerEncLabelModel.from_pretrained(model_name, map_location=torch.device("cpu"))
     nemo_model.eval()
 
-    # Configure
+    # Configure streaming params
     modules = nemo_model.sortformer_modules
     modules.chunk_len = Config.chunk_len
     modules.chunk_right_context = Config.chunk_right_context
@@ -572,15 +694,11 @@ def run_file_demo(model_name, coreml_dir, audio_path):
         nemo_model.preprocessor.featurizer.dither = 0.0
         nemo_model.preprocessor.featurizer.pad_to = 0
 
-    # Load CoreML models
-    print(f"Loading CoreML Models from {coreml_dir}...")
-    preproc_model = ct.models.MLModel(
-        os.path.join(coreml_dir, "SortformerPreprocessor.mlpackage"),
-        compute_units=ct.ComputeUnit.CPU_ONLY
-    )
+    # Load CoreML main model
+    print(f"Loading CoreML Main Model from {coreml_dir}...")
     main_model = ct.models.MLModel(
         os.path.join(coreml_dir, "SortformerPipeline.mlpackage"),
-        compute_units=ct.ComputeUnit.ALL
+        compute_units=ct.ComputeUnit.CPU_ONLY
     )
 
     # Load audio file
@@ -588,64 +706,233 @@ def run_file_demo(model_name, coreml_dir, audio_path):
     audio, _ = librosa.load(audio_path, sr=Config.sample_rate, mono=True)
     print(f"Loaded audio: {len(audio)} samples ({len(audio) / Config.sample_rate:.1f}s)")
 
-    # Create diarizer
-    diarizer = StreamingDiarizer(nemo_model, preproc_model, main_model)
+    # Use NeMo preprocessing for proper feature alignment
+    print("\nUsing NeMo preprocessing for feature alignment...")
+    audio_tensor = torch.from_numpy(audio).unsqueeze(0).float()
+    audio_length = torch.tensor([len(audio)], dtype=torch.long)
+    
+    with torch.no_grad():
+        nemo_features, nemo_feat_len = nemo_model.process_signal(
+            audio_signal=audio_tensor,
+            audio_signal_length=audio_length
+        )
+    print(f"Features: {nemo_features.shape}, length: {nemo_feat_len.item()}")
+
+    # Initialize state and prediction buffer
+    state = modules.init_streaming_state(batch_size=1, device='cpu')
+    pred_buffer = StreamingPredictionBuffer(num_speakers=4)
 
     # Setup plot
     plt.ion()
     fig, ax = plt.subplots(figsize=(14, 4))
+    im = None
+    vline = None
 
-    # Simulate streaming
-    chunk_size = int(Config.sample_rate * Config.frame_duration)
-    offset = 0
+    print("\nRunning streaming inference...")
 
-    print("\nStreaming audio with live plot...")
-
+    # Use NeMo's streaming feature loader for proper chunk boundaries
+    streaming_loader = modules.streaming_feat_loader(
+        feat_seq=nemo_features,
+        feat_seq_length=nemo_feat_len,
+        feat_seq_offset=torch.zeros((1,), dtype=torch.long)
+    )
+    
+    chunk_idx = 0
     try:
-        while offset < len(audio):
-            # Add audio chunk
-            chunk_end = min(offset + chunk_size, len(audio))
-            audio_chunk = audio[offset:chunk_end]
-            diarizer.add_audio(audio_chunk)
-            offset = chunk_end
-
-            # Process
-            diarizer.process()
-
+        for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in streaming_loader:
+            lc = round(left_offset / modules.subsampling_factor)
+            rc = round(right_offset / modules.subsampling_factor)
+            
+            # Prepare state for CoreML
+            curr_spk_len = state.spkcache.shape[1]
+            curr_fifo_len = state.fifo.shape[1]
+            
+            current_spkcache = state.spkcache
+            if curr_spk_len < Config.spkcache_len:
+                current_spkcache = torch.nn.functional.pad(
+                    current_spkcache, (0, 0, 0, Config.spkcache_len - curr_spk_len)
+                )
+            elif curr_spk_len > Config.spkcache_len:
+                current_spkcache = current_spkcache[:, :Config.spkcache_len, :]
+                
+            current_fifo = state.fifo
+            if curr_fifo_len < Config.fifo_len:
+                current_fifo = torch.nn.functional.pad(
+                    current_fifo, (0, 0, 0, Config.fifo_len - curr_fifo_len)
+                )
+            elif curr_fifo_len > Config.fifo_len:
+                current_fifo = current_fifo[:, :Config.fifo_len, :]
+            
+            # Pad chunk to fixed size for CoreML
+            chunk_np = chunk_feat_seq_t.numpy().astype(np.float32)
+            actual_len = chunk_np.shape[1]
+            if actual_len < Config.chunk_frames:
+                pad_len = Config.chunk_frames - actual_len
+                chunk_np = np.pad(chunk_np, ((0,0), (0, pad_len), (0,0)), mode='constant')
+            else:
+                chunk_np = chunk_np[:, :Config.chunk_frames, :]
+            
+            # CoreML inference
+            coreml_inputs = {
+                "chunk": chunk_np,
+                "chunk_lengths": np.array([actual_len], dtype=np.int32),
+                "spkcache": current_spkcache.numpy().astype(np.float32),
+                "spkcache_lengths": np.array([curr_spk_len], dtype=np.int32),
+                "fifo": current_fifo.numpy().astype(np.float32),
+                "fifo_lengths": np.array([curr_fifo_len], dtype=np.int32)
+            }
+            
+            st_time = time.time_ns()
+            coreml_out = main_model.predict(coreml_inputs)
+            ed_time = time.time_ns()
+            print(f"Chunk {chunk_idx}: {1e-6 * (ed_time - st_time):.2f}ms")
+            
+            coreml_preds = torch.from_numpy(coreml_out["speaker_preds"])
+            chunk_embs = torch.from_numpy(coreml_out["chunk_pre_encoder_embs"])
+            chunk_emb_len = int(coreml_out["chunk_pre_encoder_lengths"][0])
+            chunk_embs = chunk_embs[:, :chunk_emb_len, :]
+            
+            # Update state using NeMo's streaming_update
+            state, chunk_probs = modules.streaming_update(
+                streaming_state=state,
+                chunk=chunk_embs,
+                preds=coreml_preds,
+                lc=lc,
+                rc=rc
+            )
+            
+            # Core predictions (confirmed)
+            core_probs = chunk_probs.squeeze(0).detach().cpu().numpy()
+            
+            # Provisional predictions from right context
+            pred_len = coreml_preds.shape[1]
+            rc_start = pred_len - rc if rc > 0 else pred_len
+            provisional_probs = coreml_preds[0, rc_start:, :].detach().cpu().numpy() if rc > 0 else None
+            
+            # Update prediction buffer
+            pred_buffer.update(core_probs, provisional_probs)
+            
             # Update plot
-            all_probs = diarizer.get_all_probs()
+            all_probs = pred_buffer.get_all_probs(include_provisional=True)
+            confirmed_count = pred_buffer.get_confirmed_count()
+            provisional_count = pred_buffer.provisional_frames
 
             if all_probs is not None and len(all_probs) > 0:
-                ax.clear()
+                if im is None:
+                    ax.clear()
+                    im = ax.imshow(all_probs.T, aspect='auto', cmap='viridis',
+                                   vmin=0, vmax=1, interpolation='nearest')
+                    ax.set_yticks(range(4))
+                    ax.set_yticklabels([f"Spk {i}" for i in range(4)])
+                    ax.set_xlabel("Time (frames, 80ms each)")
+                    ax.set_ylabel("Speaker")
+                else:
+                    im.set_data(all_probs.T)
+                    im.set_extent([0, len(all_probs), 3.5, -0.5])
 
-                sns.heatmap(
-                    all_probs.T,
-                    ax=ax,
-                    cmap="viridis",
-                    vmin=0, vmax=1,
-                    yticklabels=[f"Spk {i}" for i in range(4)],
-                    cbar=False
-                )
+                if provisional_count > 0:
+                    if vline is not None:
+                        vline.set_xdata([confirmed_count, confirmed_count])
+                    else:
+                        vline = ax.axvline(x=confirmed_count, color='red',
+                                           linestyle='--', linewidth=2, alpha=0.8)
+                elif vline is not None:
+                    vline.set_xdata([-10, -10])
 
-                ax.set_xlabel("Time (frames, 80ms each)")
-                ax.set_ylabel("Speaker")
-                ax.set_title(f"Streaming Diarization - {len(all_probs)} frames")
+                title = f"Streaming Diarization - Confirmed: {confirmed_count} | "
+                title += f"Provisional: {provisional_count} | "
+                title += f"Total: {len(all_probs)} frames ({len(all_probs) * 0.08:.1f}s)"
+                ax.set_title(title)
 
-                plt.draw()
-                plt.pause(0.05)
-
-            # Simulate real-time (optional - comment out for fast mode)
-            # time.sleep(chunk_size / CONFIG['sample_rate'])
+                fig.canvas.draw_idle()
+                fig.canvas.flush_events()
+            
+            chunk_idx += 1
 
     except KeyboardInterrupt:
         print("\nStopped.")
 
     plt.ioff()
 
-    # Final plot
-    all_probs = diarizer.get_all_probs()
-    if all_probs is not None:
-        print(f"\nTotal: {len(all_probs)} frames ({len(all_probs) * 0.08:.1f}s)")
+    # Final results
+    coreml_probs = pred_buffer.get_all_probs(include_provisional=False)
+    provisional_count = pred_buffer.provisional_frames
+    if coreml_probs is not None:
+        print(f"\nTotal confirmed: {len(coreml_probs)} frames ({len(coreml_probs) * 0.08:.1f}s)")
+        if provisional_count > 0:
+            print(f"(Plus {provisional_count} provisional frames that were not yet refined)")
+        plt.show()
+
+    # ================================================================
+    # VERIFICATION: Compare CoreML streaming output with NeMo streaming
+    # ================================================================
+    print("\n" + "=" * 70)
+    print("VERIFICATION: Comparing CoreML vs NeMo Streaming Inference")
+    print("=" * 70)
+
+    # Run NeMo streaming inference on the same audio
+    nemo_model.streaming_mode = True
+
+    with torch.no_grad():
+        nemo_preds = nemo_model.forward_streaming(nemo_features, nemo_feat_len)
+
+    nemo_probs = nemo_preds.squeeze(0).cpu().numpy()
+
+    print(f"\nCoreML streaming frames: {len(coreml_probs)}")
+    print(f"NeMo streaming frames:   {len(nemo_probs)}")
+
+    # Align lengths for comparison
+    min_len = min(len(coreml_probs), len(nemo_probs))
+    coreml_aligned = coreml_probs[:min_len]
+    nemo_aligned = nemo_probs[:min_len]
+
+    # Compute differences
+    abs_diff = np.abs(coreml_aligned - nemo_aligned)
+    max_diff = abs_diff.max()
+    mean_diff = abs_diff.mean()
+
+    print(f"\nComparison (first {min_len} frames):")
+    print(f"  Max absolute difference:  {max_diff:.6f}")
+    print(f"  Mean absolute difference: {mean_diff:.6f}")
+
+    for spk in range(coreml_aligned.shape[1]):
+        corr = np.corrcoef(coreml_aligned[:, spk], nemo_aligned[:, spk])[0, 1]
+        print(f"  Speaker {spk} correlation:  {corr:.6f}")
+
+    if max_diff < 0.01:
+        print("\n✓ PASS: CoreML streaming output matches NeMo streaming output!")
+    elif max_diff < 0.05:
+        print("\n⚠ WARNING: Minor differences detected (max diff < 0.05)")
+        print("  This may be due to floating point precision differences.")
+    else:
+        print("\n✗ FAIL: Significant differences detected!")
+        frame_max_diff = abs_diff.max(axis=1)
+        worst_frames = np.argsort(frame_max_diff)[-5:][::-1]
+        print(f"\n  Worst 5 frames:")
+        for idx in worst_frames:
+            print(f"    Frame {idx}: CoreML={coreml_aligned[idx]}, NeMo={nemo_aligned[idx]}")
+
+    # Plot comparison if there are differences
+    if max_diff >= 0.01:
+        fig2, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+        im1 = axes[0].imshow(coreml_aligned.T, aspect='auto', cmap='viridis', vmin=0, vmax=1)
+        axes[0].set_title(f"CoreML Streaming ({len(coreml_aligned)} frames)")
+        axes[0].set_ylabel("Speaker")
+        plt.colorbar(im1, ax=axes[0])
+
+        im2 = axes[1].imshow(nemo_aligned.T, aspect='auto', cmap='viridis', vmin=0, vmax=1)
+        axes[1].set_title(f"NeMo Streaming ({len(nemo_aligned)} frames)")
+        axes[1].set_ylabel("Speaker")
+        plt.colorbar(im2, ax=axes[1])
+
+        im3 = axes[2].imshow(abs_diff.T, aspect='auto', cmap='hot', vmin=0, vmax=max_diff)
+        axes[2].set_title(f"Absolute Difference (max={max_diff:.4f}, mean={mean_diff:.4f})")
+        axes[2].set_xlabel("Frame")
+        axes[2].set_ylabel("Speaker")
+        plt.colorbar(im3, ax=axes[2])
+
+        plt.tight_layout()
         plt.show()
 
 
@@ -657,7 +944,7 @@ if __name__ == "__main__":
     parser.add_argument("--mic", action="store_true", help="Use microphone input")
     args = parser.parse_args()
 
-    run_mic_inference(args.model_name, args.coreml_dir)
-    # if args.mic:
-    # else:
-    #     run_file_demo(args.model_name, args.coreml_dir, args.audio_path)
+    if args.mic:
+        run_mic_inference(args.model_name, args.coreml_dir)
+    else:
+        run_file_demo(args.model_name, args.coreml_dir, args.audio_path)

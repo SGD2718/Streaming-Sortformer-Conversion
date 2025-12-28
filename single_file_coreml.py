@@ -263,7 +263,7 @@ def main():
     print(f"Loading CoreML Model from {coreml_dir}...")
     main_model = ct.models.MLModel(
         os.path.join(coreml_dir, "SortformerPipeline.mlpackage"),
-        compute_units=ct.ComputeUnit.ALL
+        compute_units=ct.ComputeUnit.CPU_ONLY
     )
 
     # --- Run Inference ---
