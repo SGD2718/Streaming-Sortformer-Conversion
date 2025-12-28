@@ -551,13 +551,6 @@ class SortformerModules(NeuralModule, Exportable):
             streaming_state.fifo.shape[1],
             chunk.shape[1] - lc - rc,
         )
-        if streaming_state.spk_perm is not None:
-            inv_spk_perm = torch.stack(
-                [torch.argsort(streaming_state.spk_perm[batch_index]) for batch_index in range(batch_size)]
-            )
-            preds = torch.stack(
-                [preds[batch_index, :, inv_spk_perm[batch_index]] for batch_index in range(batch_size)]
-            )
 
         streaming_state.fifo_preds = preds[:, spkcache_len : spkcache_len + fifo_len]
         chunk = chunk[:, lc : chunk_len + lc]
@@ -867,30 +860,20 @@ class SortformerModules(NeuralModule, Exportable):
         scores = self._get_log_pred_scores(preds)
         scores = self._disable_low_scores(preds, scores, min_pos_scores_per_spk)
 
-        if permute_spk:  # Generate a random permutation of speakers
-            max_perm_index = self._get_max_perm_index(scores)
-            scores, spk_perm = self._permute_speakers(scores, max_perm_index)
-        else:
-            spk_perm = None
-
-        if self.scores_boost_latest > 0:  # Boost newly added frames
-            scores[:, self.spkcache_len :, :] += self.scores_boost_latest
-
-        if self.training:
-            if self.scores_add_rnd > 0:  # Add random noise to scores
-                scores += torch.rand(batch_size, n_frames, n_spk, device=scores.device) * self.scores_add_rnd
+        # if self.scores_boost_latest > 0:  # Boost newly added frames
+        scores[:, self.spkcache_len :, :] += self.scores_boost_latest
 
         # Strong boosting to ensure each speaker has at least K frames in speaker cache
         scores = self._boost_topk_scores(scores, strong_boost_per_spk, scale_factor=2)
         # Weak boosting to prevent dominance of one speaker in speaker cache
         scores = self._boost_topk_scores(scores, weak_boost_per_spk, scale_factor=1)
 
-        if self.spkcache_sil_frames_per_spk > 0:  # Add number of silence frames in the end of each block
-            pad = torch.full((batch_size, self.spkcache_sil_frames_per_spk, n_spk), float('inf'), device=scores.device)
-            scores = torch.cat([scores, pad], dim=1)  # (batch_size, n_frames + spkcache_sil_frames_per_spk, n_spk)
+        # if self.spkcache_sil_frames_per_spk > 0:  # Add number of silence frames in the end of each block
+        pad = torch.full((batch_size, self.spkcache_sil_frames_per_spk, n_spk), float('inf'), device=scores.device)
+        scores = torch.cat([scores, pad], dim=1)  # (batch_size, n_frames + spkcache_sil_frames_per_spk, n_spk)
 
         topk_indices, is_disabled = self._get_topk_indices(scores)
         spkcache, spkcache_preds = self._gather_spkcache_and_preds(
             emb_seq, preds, topk_indices, is_disabled, mean_sil_emb
         )
-        return spkcache, spkcache_preds, spk_perm
+        return spkcache, spkcache_preds #, spk_perm
