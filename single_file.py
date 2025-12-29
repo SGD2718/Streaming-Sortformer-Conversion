@@ -16,7 +16,7 @@ matplotlib.use("TkAgg")
 # --- 1. Setup & Config ---
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 script_dir = os.path.dirname(os.path.abspath(__file__))
-audio_path = 'audio.wav'
+audio_path = 'multispeaker.wav'
 audio_file = os.path.join(script_dir, audio_path)
 config_file = os.path.join(script_dir, "config.yaml")
 
@@ -52,8 +52,8 @@ model.sortformer_modules.chunk_len = 6  # Adjusted per your snippet
 model.sortformer_modules.chunk_right_context = 7
 model.sortformer_modules.chunk_left_context = 1
 
-model.sortformer_modules.fifo_len = 188
-model.sortformer_modules.spkcache_update_period = 144
+model.sortformer_modules.fifo_len = 40
+model.sortformer_modules.spkcache_update_period = 31
 model.sortformer_modules.spkcache_len = 188
 
 model.sortformer_modules._check_streaming_parameters()
