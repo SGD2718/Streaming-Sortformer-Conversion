@@ -18,6 +18,8 @@ import librosa
 import threading
 import math
 import time
+import argparse
+import umap
 from pydub import AudioSegment
 from pydub.playback import play as play_audio
 from config import Config
@@ -80,6 +82,7 @@ def run_coreml_streaming(nemo_model, main_model, audio_path, config):
     processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long)
     
     all_preds = []
+    all_embeddings = []
     num_chunks = math.ceil(processed_signal.shape[2] / (modules.chunk_len * subsampling_factor))
     
     feat_loader = streaming_feat_loader(
@@ -158,14 +161,23 @@ def run_coreml_streaming(nemo_model, main_model, audio_path, config):
         )
         
         all_preds.append(chunk_probs)
+        
+        # Store the core embeddings (excluding left and right context)
+        core_start = lc  # Skip left context
+        core_end = chunk_emb_len - rc  # Exclude right context
+        if core_end > core_start:
+            core_embs = chunk_embs[:, core_start:core_end, :]
+            all_embeddings.append(core_embs)
+        
         print(f"\rProcessing chunk {chunk_idx + 1}/{num_chunks}", end='')
     
     print()  # Newline after progress
     
     if len(all_preds) > 0:
         final_probs = torch.cat(all_preds, dim=1)
-        return final_probs
-    return None
+        final_embeddings = torch.cat(all_embeddings, dim=1) if len(all_embeddings) > 0 else None
+        return final_probs, final_embeddings, state  # Return final state with spkcache
+    return None, None, None
 
 
 def segments_from_probs(probs, threshold=0.5, frame_shift=0.08, min_duration=0.1):
@@ -215,9 +227,55 @@ def segments_from_probs(probs, threshold=0.5, frame_shift=0.08, min_duration=0.1
     return sorted(segments, key=lambda x: x[0])
 
 
-def main():
+def compute_speaker_centroids_and_distances(embeddings, probs, num_speakers=4):
+    """
+    Compute speaker centroids and per-frame cosine distances.
+    
+    Args:
+        embeddings: numpy array [T, D] - frame embeddings
+        probs: numpy array [T, num_speakers] - speaker probabilities per frame
+        num_speakers: number of speakers
+    
+    Returns:
+        centroids: [num_speakers, D] - centroid embedding for each speaker
+        distances: [T, num_speakers] - cosine distance to each speaker's centroid per frame
+    """
+    T, D = embeddings.shape
+    centroids = np.zeros((num_speakers, D))
+    
+    # Compute weighted centroid for each speaker
+    for spk in range(num_speakers):
+        weights = probs[:, spk]  # [T]
+        weight_sum = weights.sum()
+        if weight_sum > 0:
+            # Weighted average of embeddings
+            centroids[spk] = (embeddings * weights[:, np.newaxis]).sum(axis=0) / weight_sum
+        else:
+            # No activity for this speaker, use zero vector
+            centroids[spk] = np.zeros(D)
+    
+    # Normalize centroids for cosine similarity
+    centroid_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    centroid_norms = np.where(centroid_norms > 0, centroid_norms, 1.0)
+    normalized_centroids = centroids / centroid_norms
+    
+    # Normalize embeddings
+    embedding_norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embedding_norms = np.where(embedding_norms > 0, embedding_norms, 1.0)
+    normalized_embeddings = embeddings / embedding_norms
+    
+    # Compute cosine similarity (dot product of normalized vectors)
+    # [T, D] @ [D, num_speakers] -> [T, num_speakers]
+    cosine_similarities = normalized_embeddings @ normalized_centroids.T
+    
+    # Cosine distance = 1 - cosine similarity
+    cosine_distances = 1 - cosine_similarities
+    
+    return centroids, cosine_distances
+
+def main(save_png=None):
     # --- Configuration ---
-    audio_file = "audio.wav"
+    audio_file = "multispeaker.wav"
     coreml_dir = "coreml_models"
     model_name = "nvidia/diar_streaming_sortformer_4spk-v2.1"
     
@@ -269,7 +327,7 @@ def main():
     # --- Run Inference ---
     print("Running CoreML streaming inference...")
     st_time = time.time()
-    probs_tensor = run_coreml_streaming(nemo_model, main_model, audio_file, CONFIG)
+    probs_tensor, embeddings_tensor, final_state = run_coreml_streaming(nemo_model, main_model, audio_file, CONFIG)
     ed_time = time.time()
     print(f'duration: {ed_time - st_time}')
     
@@ -278,9 +336,110 @@ def main():
         return
     
     probs = probs_tensor.squeeze(0).cpu().numpy()  # [T, 4]
+    embeddings = embeddings_tensor.squeeze(0).cpu().numpy() if embeddings_tensor is not None else None  # [T, D]
     heatmap_data = probs.T  # [4, T] for heatmap
     
     print(f"Output shape: {probs.shape}")
+    if embeddings is not None:
+        print(f"Embeddings shape: {embeddings.shape}")
+    
+    # --- Compute Speaker Centroids from Speaker Cache ---
+    l2_distances = None
+    cosine_distances = None
+    num_speakers = probs.shape[1]
+    
+    # Use spkcache and spkcache_preds from final state to compute weighted centroids
+    if final_state is not None and final_state.spkcache is not None and final_state.spkcache_preds is not None:
+        spkcache = final_state.spkcache.squeeze(0).cpu().numpy()  # [cache_len, D]
+        spkcache_preds = final_state.spkcache_preds.squeeze(0).cpu().numpy()  # [cache_len, num_speakers]
+        
+        print(f"Speaker cache shape: {spkcache.shape}")
+        print(f"Speaker cache preds shape: {spkcache_preds.shape}")
+        
+        # Normalize spkcache embeddings for cosine centroid
+        spkcache_norms = np.linalg.norm(spkcache, axis=1, keepdims=True)
+        spkcache_norms = np.where(spkcache_norms > 0, spkcache_norms, 1.0)
+        spkcache_normalized = spkcache / spkcache_norms
+        
+        # Compute weighted centroids for each speaker
+        # L2 centroid: from raw embeddings
+        # Cosine centroid: from normalized embeddings
+        centroids_l2 = np.zeros((num_speakers, spkcache.shape[1]))
+        centroids_cosine = np.zeros((num_speakers, spkcache.shape[1]))
+        for spk in range(num_speakers):
+            weights = spkcache_preds[:, spk]
+            weight_sum = weights.sum()
+            if weight_sum > 0:
+                centroids_l2[spk] = (spkcache * weights[:, np.newaxis]).sum(axis=0) / weight_sum
+                centroids_cosine[spk] = (spkcache_normalized * weights[:, np.newaxis]).sum(axis=0) / weight_sum
+        
+        # Normalize cosine centroids
+        cosine_centroid_norms = np.linalg.norm(centroids_cosine, axis=1, keepdims=True)
+        cosine_centroid_norms = np.where(cosine_centroid_norms > 0, cosine_centroid_norms, 1.0)
+        centroids_cosine = centroids_cosine / cosine_centroid_norms
+        
+        print(f"L2 centroids computed (shape: {centroids_l2.shape})")
+        print(f"Cosine centroids computed (shape: {centroids_cosine.shape})")
+        
+        # Compute distances
+        if embeddings is not None:
+            num_frames = min(len(probs), len(embeddings))
+            
+            # L2 distances from embeddings to L2 centroids
+            l2_distances = np.zeros((num_frames, num_speakers))
+            for s in range(num_speakers):
+                diff = embeddings[:num_frames] - centroids_l2[s]
+                l2_distances[:, s] = np.linalg.norm(diff, axis=1)
+            
+            # Normalize embeddings for cosine distance
+            emb_norms = np.linalg.norm(embeddings[:num_frames], axis=1, keepdims=True)
+            emb_norms = np.where(emb_norms > 0, emb_norms, 1.0)
+            normalized_embs = embeddings[:num_frames] / emb_norms
+            
+            # Cosine distances from normalized embeddings to cosine centroids
+            cos_sim = normalized_embs @ centroids_cosine.T
+            cosine_distances = 1 - cos_sim
+            
+            print(f"L2 distances computed (shape: {l2_distances.shape})")
+            print(f"Cosine distances computed (shape: {cosine_distances.shape})")
+    else:
+        print("WARNING: spkcache_preds is None - speaker cache not compressed yet. Using frame embeddings instead.")
+        if embeddings is not None:
+            num_frames = min(len(probs), len(embeddings))
+            
+            # Normalize embeddings
+            emb_norms = np.linalg.norm(embeddings[:num_frames], axis=1, keepdims=True)
+            emb_norms = np.where(emb_norms > 0, emb_norms, 1.0)
+            normalized_embs = embeddings[:num_frames] / emb_norms
+            
+            # Compute weighted centroids
+            centroids_l2 = np.zeros((num_speakers, embeddings.shape[1]))
+            centroids_cosine = np.zeros((num_speakers, embeddings.shape[1]))
+            for spk in range(num_speakers):
+                weights = probs[:num_frames, spk]
+                weight_sum = weights.sum()
+                if weight_sum > 0:
+                    centroids_l2[spk] = (embeddings[:num_frames] * weights[:, np.newaxis]).sum(axis=0) / weight_sum
+                    centroids_cosine[spk] = (normalized_embs * weights[:, np.newaxis]).sum(axis=0) / weight_sum
+            
+            # Normalize cosine centroids
+            cosine_centroid_norms = np.linalg.norm(centroids_cosine, axis=1, keepdims=True)
+            cosine_centroid_norms = np.where(cosine_centroid_norms > 0, cosine_centroid_norms, 1.0)
+            centroids_cosine = centroids_cosine / cosine_centroid_norms
+            
+            # L2 distances
+            l2_distances = np.zeros((num_frames, num_speakers))
+            for s in range(num_speakers):
+                diff = embeddings[:num_frames] - centroids_l2[s]
+                l2_distances[:, s] = np.linalg.norm(diff, axis=1)
+            
+            # Cosine distances
+            cos_sim = normalized_embs @ centroids_cosine.T
+            cosine_distances = 1 - cos_sim
+            
+            print(f"Speaker centroids computed (fallback)")
+            print(f"L2 distances computed (shape: {l2_distances.shape})")
+            print(f"Cosine distances computed (shape: {cosine_distances.shape})")
     
     # --- Extract segments from probabilities ---
     segments = segments_from_probs(probs, threshold=0.5)
@@ -309,7 +468,22 @@ def main():
                     return
     
     # --- Plotting ---
-    fig, ax = plt.subplots(figsize=(15, 6))
+    # Create figure with subplots: 1 heatmap + L2 distance plot + UMAP scatter
+    if l2_distances is not None and embeddings is not None:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        ax = axes[0]
+        l2_ax = axes[1]
+        umap_ax = axes[2]
+    elif l2_distances is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        ax = axes[0]
+        l2_ax = axes[1]
+        umap_ax = None
+    else:
+        fig, ax = plt.subplots(figsize=(15, 6))
+        l2_ax = None
+        umap_ax = None
+    
     fig.canvas.mpl_connect('button_press_event', on_click)
     
     sns.heatmap(
@@ -344,14 +518,114 @@ def main():
         rect.audio_meta = {'start': start_time, 'dur': duration}
         ax.add_patch(rect)
     
-    plt.title("CoreML Streaming Diarization (Click Pink Box to Play Audio)")
-    plt.xlabel("Time Frames (80ms steps)")
-    plt.ylabel("Speaker ID")
+    ax.set_title("CoreML Streaming Diarization (Click Pink Box to Play Audio)")
+    ax.set_xlabel("Time Frames (80ms steps)")
+    ax.set_ylabel("Speaker ID")
+    
+    # --- L2 Distance Plot (all speakers overlayed) ---
+    if l2_ax is not None and l2_distances is not None:
+        num_speakers = l2_distances.shape[1]
+        num_frames = len(l2_distances)
+        time_frames = np.arange(num_frames)
+        time_seconds = time_frames * frame_shift
+        colors = plt.cm.tab10(np.linspace(0, 1, num_speakers))
+        
+        for s in range(num_speakers):
+            l2_ax.plot(time_seconds, l2_distances[:, s], color=colors[s], linewidth=1.5, label=f'Spk {s}')
+        
+        l2_ax.set_title("L2 Distance to Each Speaker Centroid")
+        l2_ax.set_xlabel("Time (seconds)")
+        l2_ax.set_ylabel("L2 Distance")
+        l2_ax.set_xlim(0, time_seconds[-1] if len(time_seconds) > 0 else 1)
+        l2_ax.set_ylim(0, np.nanmax(l2_distances) * 1.1)
+        l2_ax.grid(True, alpha=0.3)
+        l2_ax.legend(loc='upper right', fontsize='small', ncol=2)
+    
+    # --- UMAP Scatter Plot (colored by speaker powerset) ---
+    if umap_ax is not None and embeddings is not None:
+        num_frames = min(len(probs), len(embeddings))
+        num_speakers = probs.shape[1]
+        
+        # Define distinct speaker colors using evenly spaced hues (same saturation/brightness)
+        # Using HSV with S=0.8, V=0.9 for vibrant, distinguishable colors
+        import colorsys
+        speaker_colors = []
+        for i in range(num_speakers):
+            hue = i / num_speakers  # Evenly spaced hues: 0, 0.25, 0.5, 0.75
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
+            speaker_colors.append(np.array([r, g, b]))
+        
+        # Silence color (gray)
+        silence_color = np.array([0.5, 0.5, 0.5])
+        
+        # Compute per-frame: active speakers, blended color, and opacity (max prob)
+        frame_colors = []
+        frame_alphas = []
+        frame_labels = []
+        
+        for i in range(num_frames):
+            active_speakers = tuple(s for s in range(num_speakers) if probs[i, s] > 0.5)
+            frame_labels.append(active_speakers)
+            
+            # Opacity = max probability at this frame (clipped to [0.3, 1.0] for visibility)
+            max_prob = probs[i, :].max()
+            alpha = max(0.3, min(1.0, max_prob))
+            frame_alphas.append(alpha)
+            
+            # Color = blend of active speaker colors, or gray for silence
+            if len(active_speakers) == 0:
+                color = silence_color
+            else:
+                color = np.mean([speaker_colors[s] for s in active_speakers], axis=0)
+            frame_colors.append(color)
+        
+        frame_colors = np.array(frame_colors)
+        frame_alphas = np.array(frame_alphas)
+        
+        # Perform UMAP
+        reducer = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.05, random_state=42)
+        embs_2d = reducer.fit_transform(embeddings[:num_frames])
+        
+        # Get unique labels for legend
+        unique_labels = sorted(set(frame_labels), key=lambda x: (len(x), x))
+        
+        # Compute legend colors (same blending logic)
+        label_to_color = {}
+        for label in unique_labels:
+            if len(label) == 0:
+                label_to_color[label] = silence_color
+            else:
+                label_to_color[label] = np.mean([speaker_colors[s] for s in label], axis=0)
+        
+        # Plot points individually to support per-point alpha
+        for i in range(num_frames):
+            umap_ax.scatter(embs_2d[i, 0], embs_2d[i, 1], 
+                           c=[frame_colors[i]], s=20, alpha=frame_alphas[i])
+        
+        # Add legend manually with representative colors
+        for label in unique_labels:
+            label_str = '{' + ','.join(map(str, label)) + '}' if label else '∅'
+            umap_ax.scatter([], [], c=[label_to_color[label]], s=40, label=label_str)
+        
+        umap_ax.set_title("UMAP of Frame Embeddings (colored by active speakers)")
+        umap_ax.set_xlabel("UMAP 1")
+        umap_ax.set_ylabel("UMAP 2")
+        umap_ax.legend(loc='upper right', fontsize='small', ncol=2, title='Speakers')
+        umap_ax.grid(True, alpha=0.3)
+    
     plt.tight_layout()
     
-    print("\nInference complete. Interactive window opening...")
-    plt.show()
+    if save_png:
+        plt.savefig(save_png, dpi=150, bbox_inches='tight')
+        print(f"\nPlot saved to {save_png}")
+    else:
+        print("\nInference complete. Interactive window opening...")
+        plt.show()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="CoreML Streaming Diarization Visualization")
+    parser.add_argument("--save-png", type=str, default=None, 
+                        help="Save plot to PNG file instead of showing interactively")
+    args = parser.parse_args()
+    main(save_png=args.save_png)
