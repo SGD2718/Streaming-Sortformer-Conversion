@@ -210,7 +210,12 @@ class StreamingDiarizer:
     def process(self):
         """
         Process available audio through preprocessor and diarizer.
-        Returns new probability frames if available (including provisional).
+        Returns new probability frames if available (including tentative).
+        
+        Strategy:
+        - Wait for FULL right context before processing (for accuracy)
+        - Output confirmed predictions for core frames
+        - Output tentative predictions for right context frames (early guess for next chunk)
         
         Sliding window preprocessing for ~2Hz updates:
         - First run: Wait for coreml_audio_size samples (full window)
@@ -262,17 +267,16 @@ class StreamingDiarizer:
             chunk_start = self.diar_chunk_idx * self.core_frames
             chunk_end = chunk_start + self.core_frames
 
-            # RIGHT CONTEXT CREATES LATENCY:
-            # We need core + full right_ctx features before we can output CONFIRMED predictions
-            # Confirmed predictions are always right_ctx frames BEHIND the latest audio
-            required_features = chunk_end + self.right_ctx  # Need full right context
+            # Wait for FULL right context before processing
+            # This ensures accurate predictions (no partial context)
+            required_features = chunk_end + self.right_ctx
             
             if required_features > total_features:
                 break  # Not enough features yet - wait for more audio
 
-            # We have full context - extract with full left and right context
+            # Extract with full left and right context
             left_offset = min(self.left_ctx, chunk_start)
-            right_offset = self.right_ctx  # Always full right context now
+            right_offset = self.right_ctx  # Always full right context
 
             feat_start = chunk_start - left_offset
             feat_end = chunk_end + right_offset
@@ -284,7 +288,7 @@ class StreamingDiarizer:
             # Transpose to [B, T, D]
             chunk_t = chunk_feat_tensor.transpose(1, 2)
 
-            # Pad to full chunk_frames (handles partial right context)
+            # Pad to full chunk_frames
             if actual_len < Config.chunk_frames:
                 pad_len = Config.chunk_frames - actual_len
                 chunk_in = torch.nn.functional.pad(chunk_t, (0, 0, 0, pad_len))
@@ -333,9 +337,14 @@ class StreamingDiarizer:
             chunk_embs = chunk_embs[:, :chunk_emb_len, :]
 
             lc = round(left_offset / self.subsampling)
-            rc = Config.chunk_right_context  # Always 7 now since we wait for full right context
+            rc = Config.chunk_right_context  # Full right context (7 diar frames)
 
-            # Update streaming state - this returns the properly extracted chunk predictions
+            # Save state lengths BEFORE update for correct indexing
+            pre_spkcache_len = curr_spk_len
+            pre_fifo_len = curr_fifo_len
+            core_len = Config.chunk_len  # 6 diar frames
+
+            # Update streaming state - returns confirmed core predictions
             self.state, chunk_probs = self.modules.streaming_update(
                 streaming_state=self.state,
                 chunk=chunk_embs,
@@ -344,30 +353,18 @@ class StreamingDiarizer:
                 rc=rc
             )
 
-            # Use chunk_probs from streaming_update as our core (confirmed) predictions
-            # This is what NeMo's forward_streaming uses, ensuring consistency
+            # Core predictions (confirmed) - these are the 6 core frames
             core_probs = chunk_probs.squeeze(0).detach().cpu().numpy()
 
-            # For provisional predictions (tentative display only), extract right context
-            # These are early guesses that will be replaced when processed as core
-            spkcache_len = self.state.spkcache.shape[1]
-            fifo_len = self.state.fifo.shape[1]
-            core_len = Config.chunk_len  # 6
-            # Note: After streaming_update, fifo has been updated, so we use pre-update lengths
-            # Actually, we need to extract from pred_logits using the indices BEFORE the update
-            # The right context predictions are at: spkcache_len + fifo_len + lc + core_len : ... + rc
-            # But since fifo was just updated, we need to compute from original lengths
-            # Let's compute based on the prediction tensor structure
-            pred_len = pred_logits.shape[1]
-            core_start = pred_len - lc - core_len - rc + lc  # This is complex due to state changes
-            
-            # Simpler approach: provisional predictions are the right context portion
-            # which starts at (total_pred_len - rc) and goes to end
-            rc_start = pred_len - rc
-            provisional_probs = pred_logits[0, rc_start:, :].detach().cpu().numpy()
+            # Tentative predictions for the FULL right context (7 frames)
+            # These are at: spkcache_len + fifo_len + lc + core_len ... + rc
+            # (NOT at the end of the padded array!)
+            tentative_start = pre_spkcache_len + pre_fifo_len + lc + core_len
+            tentative_end = tentative_start + rc
+            tentative_probs = pred_logits[0, tentative_start:tentative_end, :].detach().cpu().numpy()
 
-            # Update the prediction buffer with core and provisional predictions
-            self.pred_buffer.update(core_probs, provisional_probs)
+            # Update the prediction buffer: confirmed core + tentative right context
+            self.pred_buffer.update(core_probs, tentative_probs)
             
             # Also maintain backward compatibility with all_probs list
             self.all_probs.append(core_probs)
